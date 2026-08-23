@@ -7232,10 +7232,12 @@ namespace VDISPLAY_SUNSHINE {
       }
       const auto dpi_settings_prefix = virtual_display_dpi_settings_prefix(display_id);
       const auto configured_scale = config::video.dd.virtual_display_scale_percent;
+      const auto configured_image_width_mm = config::video.dd.virtual_display_image_width_mm;
       const auto effective_scale = VDISPLAY::effective_virtual_display_scale_percent(
         configured_scale,
         width,
-        height
+        height,
+        configured_image_width_mm
       );
       const auto dpi_snapshot = configured_scale == 0 ?
         read_virtual_display_dpi_value(dpi_settings_prefix) :
@@ -7266,7 +7268,9 @@ namespace VDISPLAY_SUNSHINE {
                        << ", HDR peak=" << create_request.hdr_max_luminance_nits << " nits"
                        << ", scale=" << effective_scale << "%"
                        << ", physical=" << create_request.physical_width_mm << 'x'
-                       << create_request.physical_height_mm << " mm).";
+                       << create_request.physical_height_mm << " mm"
+                       << ", measured image width=" << configured_image_width_mm << " mm"
+                       << ").";
       sunshine_driver::ControlResult<sunshine_driver::CreateTemporaryDisplayResult> create_result;
       if (reclaimed_for_reuse) {
         // Ownership is already established in-place. Enter the existing-display
@@ -7966,7 +7970,8 @@ namespace VDISPLAY_SUNSHINE {
         const auto scale_percent = VDISPLAY::effective_virtual_display_scale_percent(
           config::video.dd.virtual_display_scale_percent,
           width,
-          height
+          height,
+          config::video.dd.virtual_display_image_width_mm
         );
         if (scale_percent > 0) {
 

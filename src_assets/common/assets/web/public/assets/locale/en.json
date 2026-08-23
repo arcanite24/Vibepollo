@@ -574,6 +574,8 @@
     "dd_paused_virtual_display_timeout_secs_desc": "Optional grace delay before removing virtual displays while a session is paused and revert-on-disconnect is disabled. 0 keeps the virtual display alive until resume or app exit.",
     "dd_paused_virtual_display_timeout_secs_warning": "Removing a virtual display while a game is still running can cause crashes regardless of trigger (timeout, hotkey, or manual restore). This option helps prevent returning to a stuck virtual screen after inactivity.",
     "dd_paused_virtual_display_timeout_secs_hotkey_hint": "Alternative: use the restore hotkey to immediately terminate and restore display state when needed.",
+    "dd_virtual_display_image_width_mm": "Client image width (mm)",
+    "dd_virtual_display_image_width_mm_desc": "Width of the image area the client actually displays, in millimetres. With the automatic (Recommended) virtual display scale, the host derives the client's pixel density from it and picks the nearest Windows scale. Measure the image area, not the device. 0 (default) disables it.",
     "dd_virtual_display_scale": "Virtual Display Scale",
     "dd_virtual_display_scale_desc": "Retain existing (default) preserves your current scale for future streams. On Windows, connect to the virtual display and set Scale in Settings > System > Display. In Vibepollo, you can also select an explicit percentage or Recommended (resolution-based) without changing the client resolution.",
     "virtual_display_outputs": "Linux private display connectors",

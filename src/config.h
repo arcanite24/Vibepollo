@@ -248,6 +248,7 @@ namespace config {
       bool use_sunshine_virtual_display_driver;  ///< Use the Vibepollo Display Driver instead of rollback drivers such as SudoVDA.
       bool activate_virtual_display;  ///< Auto-activate Sunshine virtual display when selected as the target output.
       int virtual_display_scale_percent;  ///< Virtual-display scale percent (-1 is automatic; 0 preserves the compositor's choice).
+      int virtual_display_image_width_mm;  ///< Width of the client's visible image area in millimetres (0 disables). Refines the automatic virtual-display scale.
       int virtual_display_permanent_count;  ///< Number of always-present Sunshine virtual displays to request when explicitly configured.
       bool virtual_display_permanent_count_configured;  ///< False preserves installs that predate this setting.
       std::vector<std::string> virtual_display_outputs;  ///< Linux connector names reserved for private streaming displays; empty enables managed-VKMS discovery.

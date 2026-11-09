@@ -2347,6 +2347,7 @@ namespace rtsp_stream {
     args.try_emplace("x-nv-aqos.qosTrafficType"sv, "4"sv);
     args.try_emplace("x-ml-video.configuredBitrateKbps"sv, "0"sv);
     args.try_emplace("x-ml-video.fecPercent"sv, "-1"sv);
+    args.try_emplace("x-ml-video.sendRateMbps"sv, "0"sv);
     args.try_emplace("x-ss-general.encryptionEnabled"sv, "0"sv);
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
@@ -2359,6 +2360,7 @@ namespace rtsp_stream {
 
     std::int64_t configuredBitrateKbps;
     std::int64_t requestedFecPercentage = -1;
+    std::int64_t requestedSendRateMbps = 0;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session->host_audio;
     try {
       config.audio.channels = (int) util::from_view(args.at("x-nv-audio.surround.numChannels"sv));
@@ -2390,6 +2392,7 @@ namespace rtsp_stream {
 
       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
       requestedFecPercentage = util::from_view(args.at("x-ml-video.fecPercent"sv));
+      requestedSendRateMbps = util::from_view(args.at("x-ml-video.sendRateMbps"sv));
       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
@@ -2482,6 +2485,17 @@ namespace rtsp_stream {
         BOOST_LOG(info) << "Client requested "sv << requestedFecPercentage << "% FEC"sv;
       } else {
         BOOST_LOG(warning) << "Client requested "sv << requestedFecPercentage << "% FEC, which is out of range; using "sv << config.fecPercentage << '%';
+      }
+    }
+
+    // A client may ask for its own video send rate (x-ml-video.sendRateMbps), as it knows
+    // what its link can take in a burst. Clients that don't ask keep the fixed 800 Mbps.
+    config.sendRateMbps = stream::session_video_send_rate((int) std::clamp<std::int64_t>(requestedSendRateMbps, 0, 1'000'000), stream::DEFAULT_VIDEO_SEND_RATE_MBPS);
+    if (requestedSendRateMbps > 0) {
+      if (config.sendRateMbps == requestedSendRateMbps) {
+        BOOST_LOG(info) << "Client requested a video send rate of "sv << requestedSendRateMbps << " Mbps"sv;
+      } else {
+        BOOST_LOG(warning) << "Client requested a video send rate of "sv << requestedSendRateMbps << " Mbps, which is out of range; using "sv << config.sendRateMbps << " Mbps"sv;
       }
     }
 

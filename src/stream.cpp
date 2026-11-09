@@ -2764,8 +2764,9 @@ namespace stream {
         const auto pacing_ceiling = config::stream.pacing_max_bitrate_kbps;
         const auto capped_batch_packets = video_pacing_batch_packets(
           pacing_ceiling, blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0));
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
-        ratecontrol_packets_in_1ms = std::max<size_t>(1, ratecontrol_packets_in_1ms);
+        // The session's send rate: the client's x-ml-video.sendRateMbps request, or
+        // 800 Mbps (80% of gigabit) as before.
+        size_t ratecontrol_packets_in_1ms = video_send_rate_packets_per_ms(session->config.sendRateMbps, blocksize);
         std::size_t ordinary_batch_quantum_packets = 1;
         if (pacing_ceiling > 0 && capped_batch_packets == 0) {
           BOOST_LOG(error) << "Configured pacing ceiling has an invalid video datagram"sv;

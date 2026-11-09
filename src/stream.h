@@ -62,6 +62,9 @@ namespace stream {
     // Percentage of FEC packets added to each video frame: the client's
     // x-ml-video.fecPercent request, or the host's fec_percentage.
     int fecPercentage = 0;
+    // Rate each video frame's packets are sent at: the client's
+    // x-ml-video.sendRateMbps request, or DEFAULT_VIDEO_SEND_RATE_MBPS.
+    int sendRateMbps = DEFAULT_VIDEO_SEND_RATE_MBPS;
     int mlFeatureFlags;
     int controlProtocolType;
     int audioQosType;

@@ -70,6 +70,19 @@ namespace video::policy {
     return {value / divisor, 100 / divisor};
   }
 
+  rational_t framerate_uhz_to_rational(std::int32_t value) {
+    const auto divisor = std::gcd(value, 1'000'000);
+    return {value / divisor, 1'000'000 / divisor};
+  }
+
+  bool exact_framerate_matches(std::int64_t exact_value, std::int64_t units_per_hz, int framerate) {
+    if (exact_value <= 0 || units_per_hz <= 0 || framerate <= 0) {
+      return false;
+    }
+    const auto difference = exact_value - std::int64_t {framerate} * units_per_hz;
+    return difference > -units_per_hz && difference < units_per_hz;
+  }
+
   std::optional<std::string> select_encoder(
     std::span<const std::string_view> preference,
     encoder_requirements_t requirements,

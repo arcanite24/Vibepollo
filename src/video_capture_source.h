@@ -25,6 +25,11 @@ namespace video {
 
   template<class Config>
   policy::rational_t capture_pacing(const Config &config, const capture_pacing_context_t &context = {}) {
+    if constexpr (requires { config.framerateUhz; }) {
+      if (config.framerateUhz > 0) {
+        return policy::framerate_uhz_to_rational(config.framerateUhz);
+      }
+    }
     if (config.framerateX100 > 0) {
       return policy::framerate_x100_to_rational(config.framerateX100);
     }
@@ -107,6 +112,9 @@ namespace video {
       if (lhs > rhs || (lhs == rhs && context.config.framerateX100 > 0 && result->framerateX100 <= 0)) {
         result->framerate = context.config.framerate;
         result->framerateX100 = context.config.framerateX100;
+        if constexpr (requires { result->framerateUhz; }) {
+          result->framerateUhz = context.config.framerateUhz;
+        }
       }
     }
     if constexpr (requires { result->shared_capture_pyrowave; }) {

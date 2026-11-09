@@ -96,6 +96,12 @@ namespace video::policy {
   };
 
   rational_t framerate_x100_to_rational(std::int32_t value);
+  // A client's exact rate in microhertz (x-ml-video.clientRefreshRateUhz), e.g.
+  // 71.8317 Hz as 71831700, reduced to lowest terms.
+  rational_t framerate_uhz_to_rational(std::int32_t value);
+  // Whether an exact client rate (X100 or microhertz) agrees with its integer
+  // maxFPS: within one frame per second. Coarser disagreement means a stale value.
+  bool exact_framerate_matches(std::int64_t exact_value, std::int64_t units_per_hz, int framerate);
 
   struct encoder_requirements_t {
     bool hdr = false;

@@ -97,6 +97,10 @@ namespace video {
     // is PyroWave, which pins and reads each capture image's own texture and
     // keyed mutex, so the capture must give every image a stable copy.
     bool shared_capture_pyrowave = false;
+    // Optional exact client rate in microhertz (x-ml-video.clientRefreshRateUhz),
+    // e.g. 71.8317 Hz as 71831700. Finer than framerateX100 and preferred over it.
+    // 0 when the client didn't send one.
+    int framerateUhz = 0;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -538,5 +542,28 @@ namespace video {
   inline AVRational framerateX100_to_rational(const int framerateX100) {
     const auto rational = policy::framerate_x100_to_rational(framerateX100);
     return AVRational {rational.numerator, rational.denominator};
+  }
+
+  /**
+   * @brief Whether the client asked for an exact (fractional) rate.
+   */
+  template<class Config>
+  inline bool has_exact_framerate(const Config &config) {
+    return config.framerateUhz > 0 || config.framerateX100 > 0;
+  }
+
+  /**
+   * @brief The client's exact rate: microhertz if sent, then X100, else the integer rate.
+   */
+  template<class Config>
+  inline AVRational exact_framerate_to_rational(const Config &config) {
+    if (config.framerateUhz > 0) {
+      const auto rational = policy::framerate_uhz_to_rational(config.framerateUhz);
+      return AVRational {rational.numerator, rational.denominator};
+    }
+    if (config.framerateX100 > 0) {
+      return framerateX100_to_rational(config.framerateX100);
+    }
+    return AVRational {config.framerate, 1};
   }
 }  // namespace video

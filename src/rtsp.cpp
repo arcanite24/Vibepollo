@@ -2352,6 +2352,7 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
+    args.try_emplace("x-ml-video.clientRefreshRateUhz"sv, "0"sv);
 
     stream::config_t config {};
     config.gen1_framegen_fix = false;
@@ -2415,6 +2416,8 @@ namespace rtsp_stream {
       config.monitor.framerate = normalized_framerate->capture_framerate;
       config.monitor.encodingFramerate = normalized_framerate->encoding_framerate;
       config.monitor.framerateX100 = (int) util::from_view(args.at("x-nv-video[0].clientRefreshRateX100"sv));
+      // The same to a millionth of a hertz, from Moonlight forks that match the host to their display
+      config.monitor.framerateUhz = (int) std::clamp<std::int64_t>(util::from_view(args.at("x-ml-video.clientRefreshRateUhz"sv)), 0, 1'000'000'000);
       config.monitor.bitrate = (int) util::from_view(args.at("x-nv-vqos[0].bw.maximumBitrateKbps"sv));
       config.monitor.client_requested_bitrate = config.monitor.bitrate;
       config.monitor.slicesPerFrame = (int) util::from_view(args.at("x-nv-video[0].videoEncoderSlicesPerFrame"sv));
@@ -2437,14 +2440,30 @@ namespace rtsp_stream {
       // Some clients send a stale or incorrect clientRefreshRateX100 (e.g. 6000 = 60fps)
       // while requesting a higher maxFPS (e.g. 120). Since framerateX100 unconditionally
       // overrides capture pacing, an inconsistent value caps the stream to the wrong fps.
+      // A fractional rate within one frame per second of maxFPS is kept even when it doesn't
+      // round to it (e.g. 59.49 Hz with maxFPS 60): only coarser disagreement is stale.
       if (config.monitor.framerateX100 > 0 && config.monitor.framerate > 0) {
-        int fps_from_x100 = (int) std::lround(config.monitor.framerateX100 / 100.0);
-        if (fps_from_x100 != config.monitor.framerate) {
+        if (!video::policy::exact_framerate_matches(config.monitor.framerateX100, 100, config.monitor.framerate)) {
           BOOST_LOG(warning) << "clientRefreshRateX100 ("
-                             << config.monitor.framerateX100 << " = " << fps_from_x100
+                             << config.monitor.framerateX100 << " = " << config.monitor.framerateX100 / 100.0
                              << "fps) disagrees with maxFPS (" << config.monitor.framerate
                              << "); ignoring clientRefreshRateX100";
           config.monitor.framerateX100 = 0;
+        }
+      }
+      if (config.monitor.framerateUhz > 0 && config.monitor.framerate > 0) {
+        if (!video::policy::exact_framerate_matches(config.monitor.framerateUhz, 1'000'000, config.monitor.framerate)) {
+          BOOST_LOG(warning) << "clientRefreshRateUhz ("
+                             << config.monitor.framerateUhz << " = " << config.monitor.framerateUhz / 1'000'000.0
+                             << "fps) disagrees with maxFPS (" << config.monitor.framerate
+                             << "); ignoring clientRefreshRateUhz";
+          config.monitor.framerateUhz = 0;
+        } else {
+          BOOST_LOG(info) << "Client requested an exact frame rate of "sv << config.monitor.framerateUhz / 1'000'000.0 << " fps"sv;
+          // Code that only knows hundredths gets the nearest of those.
+          if (config.monitor.framerateX100 <= 0) {
+            config.monitor.framerateX100 = (config.monitor.framerateUhz + 5'000) / 10'000;
+          }
         }
       }
 

@@ -245,6 +245,18 @@ namespace remote_session {
     bool exclusive_retained_owner = false
   );
   [[nodiscard]] bool is_secondary_game_client(std::string_view app_owner_uuid, std::string_view caller_uuid);
+  /**
+   * Whether a game transport attaches to the running app's output instead of preparing its own.
+   * A secondary client (not the app's owner) joins only when there is an output to join: a live
+   * stream, or a capture-ready retained output. A paused app whose owner display was released has
+   * none, and joining it would stream nothing.
+   */
+  [[nodiscard]] bool game_transport_joins_existing_output(
+    bool secondary_game_client,
+    bool stream_active,
+    bool retained_output_ready,
+    bool exclusive_retained_owner
+  );
   [[nodiscard]] std::string_view stream_start_response_key(bool launched_from_applist);
   [[nodiscard]] std::optional<control_completion_t> successful_control_completion(control_e control);
   [[nodiscard]] bool input_uses_display_or_audio(role_e role);

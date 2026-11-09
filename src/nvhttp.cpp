@@ -6122,13 +6122,15 @@ launch_session->exact_target_hold.reset();
         VDISPLAY::supportsRequestedResolutionCatalog();
     }
 #endif
-    const bool joining_existing_game_output =
-      secondary_game_client || remote_session::joins_existing_game_output(
-        remote_session::role_e::game,
-        !no_active_sessions,
-        retained_game_output_ready,
-        exclusive_retained_catalog_owner
-      );
+    const bool joining_existing_game_output = remote_session::game_transport_joins_existing_output(
+      secondary_game_client,
+      !no_active_sessions,
+      retained_game_output_ready,
+      exclusive_retained_catalog_owner
+    );
+    if (secondary_game_client && !joining_existing_game_output) {
+      BOOST_LOG(info) << "The running app is paused with no capture output to join; preparing this client's display.";
+    }
 
     std::unordered_map<std::string, std::string> requested_runtime_overrides;
     const auto running_app = proc::proc.resolve_app(current_appid);

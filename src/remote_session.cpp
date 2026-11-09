@@ -400,6 +400,18 @@ namespace remote_session {
     return !app_owner_uuid.empty() && app_owner_uuid != caller_uuid;
   }
 
+  bool game_transport_joins_existing_output(
+    const bool secondary_game_client,
+    const bool stream_active,
+    const bool retained_output_ready,
+    const bool exclusive_retained_owner
+  ) {
+    if (secondary_game_client) {
+      return stream_active || retained_output_ready;
+    }
+    return joins_existing_game_output(role_e::game, stream_active, retained_output_ready, exclusive_retained_owner);
+  }
+
   std::string_view stream_start_response_key(const bool launched_from_applist) {
     return launched_from_applist ? "gamesession" : "resume";
   }

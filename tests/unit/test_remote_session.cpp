@@ -450,6 +450,20 @@ TEST(RemoteSession, SecondaryGameTransportJoinsActiveOrRetainedOutput) {
   EXPECT_FALSE(remote_session::joins_existing_game_output(remote_session::role_e::input, false, true));
 }
 
+TEST(RemoteSession, SecondaryClientJoinsOnlyAnOutputThatExists) {
+  using remote_session::game_transport_joins_existing_output;
+  // secondary, stream active, retained output ready, exclusive retained owner
+  EXPECT_TRUE(game_transport_joins_existing_output(true, true, false, false));
+  EXPECT_TRUE(game_transport_joins_existing_output(true, false, true, false));
+  // Paused app, owner display released: nothing to join, so the client prepares its own
+  EXPECT_FALSE(game_transport_joins_existing_output(true, false, false, false));
+  // The owner keeps the existing rules
+  EXPECT_TRUE(game_transport_joins_existing_output(false, true, false, false));
+  EXPECT_TRUE(game_transport_joins_existing_output(false, false, true, false));
+  EXPECT_FALSE(game_transport_joins_existing_output(false, false, true, true));
+  EXPECT_FALSE(game_transport_joins_existing_output(false, false, false, false));
+}
+
 TEST(RemoteSession, SecondaryGameClientIsDeterminedByRunningAppOwner) {
   EXPECT_FALSE(remote_session::is_secondary_game_client("owner", "owner"));
   EXPECT_TRUE(remote_session::is_secondary_game_client("owner", "other"));

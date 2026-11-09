@@ -1006,6 +1006,7 @@ export const settingsCategories: SettingsCategory[] = [
           number('qp', { min: 0, max: 51, step: 1 }),
           number('fec_percentage', { min: 1, max: 255, step: 1 }),
           number('video_max_batch_size_kb', { min: 1, step: 1 }),
+          boolean('host_link_rate_adaptation'),
           number('pyrowave_critical_fec_percentage', {
             min: 0,
             max: 255,
@@ -1278,6 +1279,7 @@ export const settingsDefaults: Record<string, unknown> = {
   qp: 28,
   fec_percentage: 20,
   video_max_batch_size_kb: 64,
+  host_link_rate_adaptation: false,
   pyrowave_critical_fec_percentage: 20,
   rtss_install_path: '',
   rtss_frame_limit_type: 'async',

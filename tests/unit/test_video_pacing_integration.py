@@ -49,6 +49,13 @@ helper_end = ('  static broadcast_runtime::controls_t<broadcast_ctx_t>'
 helpers = section('  static video_pacing_reservation_t pacing_reservation_for_config(', helper_end)
 start_at = source.index('    int start(session_t &session,')
 bitrate_init = section('      const auto &monitor = session.config.monitor;', '      session.broadcast_ref = broadcast.ref();', start_at)
+# Link rate adaptation (host_link_rate_adaptation) has its own component test; the
+# pacing replay keeps it off and omits its setup.
+link_rate_begin = '      // Link rate adaptation changes the encoder bitrate;'
+if link_rate_begin in bitrate_init:
+    link_rate_end = bitrate_init.index('host adaptation is off for PyroWave', bitrate_init.index(link_rate_begin))
+    link_rate_end = bitrate_init.index('      }\n', link_rate_end) + len('      }\n')
+    bitrate_init = bitrate_init[:bitrate_init.index(link_rate_begin)] + bitrate_init[link_rate_end:]
 publish = section('      // Insert this session into the session list', '\n      auto addr =', start_at)
 if updated:
     assert 'constexpr int START_PACING_REJECTED = -2;' in read('src/stream.h')

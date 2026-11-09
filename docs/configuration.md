@@ -5503,7 +5503,63 @@ Uses NVIDIA intra refresh instead of full keyframes when supported.
 
 ### nvenc_temporal_aq
 
-Enables NVIDIA temporal adaptive quantization when supported.
+Enables NVIDIA temporal adaptive quantization when supported: more bitrate goes to frames with more
+motion, reducing block-artefact pulsing in moving scenes. Default `disabled`.
+
+### nvenc_aq_strength
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Strength of Spatial AQ from 1 (subtle) to 15 (aggressive).
+            Only applies when [nvenc_spatial_aq](#nvenc_spatial_aq) is enabled. Set to 0 to let the driver decide.
+            Higher values push more bitrate into flat regions, which helps most at low bitrates.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-15</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_aq_strength = 8
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_weighted_prediction
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Improves compression of fades and gradual lighting changes using CUDA cores, when the GPU supports it.
+            HEVC split-frame encoding is disabled while it is active.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_weighted_prediction = disabled
+            @endcode</td>
+    </tr>
+</table>
 
 ### pacing_max_bitrate_kbps
 

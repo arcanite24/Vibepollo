@@ -384,6 +384,13 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::chrono::steady_clock::time_point packet_enqueue_timestamp = std::chrono::steady_clock::now();
+    /// Which part of a frame sent while it is encoded this is, from 0, or -1 for a whole
+    /// frame (nvenc_subframe). See video_subframe.h.
+    int subframe_part = -1;
+    /// Whether this is the last part of a frame sent in parts.
+    bool subframe_final = false;
+    /// When the encoder handed over this part of a frame sent in parts.
+    std::chrono::steady_clock::time_point subframe_ready {};
   };
 
   struct packet_raw_avcodec: packet_raw_t {

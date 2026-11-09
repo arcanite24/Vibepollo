@@ -75,6 +75,7 @@ extern "C" {
 #include "utility.h"
 #include "uuid.h"
 #include "video_send.h"
+#include "video_subframe.h"
 #include "video_adaptive_pacing.h"
 #include "video_fec_status.h"
 #include "video_pacing_policy.h"
@@ -722,6 +723,20 @@ namespace stream {
       udp::endpoint peer;
       // When a clock sync request was last answered. Receive thread only, under _sessions.
       std::chrono::steady_clock::time_point last_clock_sync;
+
+      // A frame being sent in parts while NVENC encodes it (nvenc_subframe). See
+      // video_subframe.h. Video broadcast thread only.
+      struct {
+        int64_t frame_index = -1;  // Frame being sent, or -1 for none.
+        std::vector<uint8_t> pending;  // Bytes not sent yet, starting with the frame header until the first block goes out.
+        std::size_t blocks_sent = 0;  // FEC blocks of the frame sent so far.
+        uint32_t timestamp = 0;  // RTP timestamp of the frame.
+        bool dupe = false;  // Whether the frame repeats an earlier one.
+        bool announced = false;  // Whether sending in parts has been logged for this session.
+        std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  // The frame's send timestamp, from its first part.
+        std::chrono::steady_clock::time_point first_part_ready;  // When the frame's first part came out of the encoder.
+        std::chrono::steady_clock::duration last_remaining {};  // The last frame's time from its first part to its last.
+      } subframe;
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -2543,6 +2558,18 @@ namespace stream {
       if (!session) {
         continue;
       }
+
+      // A part of a frame sent while it is encoded (nvenc_subframe). See video_subframe.h.
+      const bool subframe_part = packet->subframe_part >= 0;
+      auto &subframe = session->video.subframe;
+      if (!subframe_part) {
+        // A frame that was being sent in parts will not be finished now
+        subframe.frame_index = -1;
+      } else if (packet->subframe_part > 0 && subframe.frame_index != packet->frame_index()) {
+        // The start of this frame never went out
+        continue;
+      }
+
       const auto packet_pop_timestamp = std::chrono::steady_clock::now();
       auto wire_state_it = wire_timeline_by_session.find(session);
       if (wire_state_it == wire_timeline_by_session.end()) {
@@ -2593,7 +2620,9 @@ namespace stream {
       frame_header.frameType = packet->is_idr()                     ? 2 :
                                packet->after_ref_frame_invalidation ? 5 :
                                                                       1;
-      frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
+      // A frame sent in parts does not know its size when its header goes out. H.264 and
+      // HEVC decoders skip the zero padding after the frame, and only those are sent in parts.
+      frame_header.lastPayloadLen = subframe_part ? 0 : (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
       if (frame_header.lastPayloadLen == 0) {
         frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
       }
@@ -2605,10 +2634,24 @@ namespace stream {
           return (uint16_t) std::clamp<decltype(duration_us)>((duration_us + 50) / 100, 0, std::numeric_limits<uint16_t>::max());
         };
 
-        uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *host_processing_timestamp);
-        frame_header.frame_processing_latency = latency;
-        frame_processing_latency_logger.collect_and_log(latency / 10.);
-        session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+        if (subframe_part) {
+          // The header goes out with the first part, while the rest of the frame is still
+          // encoding, so the previous frame's remaining encode time stands in for it. Parts
+          // are timed from when the encoder handed them over, not from when they were sent.
+          if (packet->subframe_part == 0) {
+            uint16_t latency = duration_to_latency(video::subframe::estimated_latency(packet->subframe_ready - *host_processing_timestamp, subframe.last_remaining));
+            frame_header.frame_processing_latency = latency;
+            session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+          }
+          if (packet->subframe_final) {
+            frame_processing_latency_logger.collect_and_log(std::chrono::duration<double, std::milli>(packet->subframe_ready - *host_processing_timestamp).count());
+          }
+        } else {
+          uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *host_processing_timestamp);
+          frame_header.frame_processing_latency = latency;
+          frame_processing_latency_logger.collect_and_log(latency / 10.);
+          session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+        }
       } else {
         frame_header.frame_processing_latency = 0;
         session->stats.last_encode_latency_us10.store(0, std::memory_order_relaxed);
@@ -2635,9 +2678,11 @@ namespace stream {
                                             0;
       frame_header.pyrowave_critical_packets = std::uint16_t(std::min<std::size_t>(critical_shards, std::numeric_limits<std::uint16_t>::max()));
 
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
-
-      payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      std::vector<uint8_t> payload_new;
+      if (!subframe_part) {
+        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+        payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      }
 
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = pyrowave::protocol::MAX_FEC_BLOCKS;
@@ -2645,6 +2690,13 @@ namespace stream {
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
       std::array<int, MAX_FEC_BLOCKS> fec_block_percentages {};
       std::size_t fec_blocks_needed = 0;
+      // The blocks this packet sends: all of the frame's, or for a frame sent in parts, the
+      // ones this part completes, at their place in the frame.
+      std::size_t first_block = 0;
+      std::size_t last_block = 0;
+      std::size_t subframe_part_shards = 0;
+      static_assert(video::subframe::blocks <= MAX_FEC_BLOCKS);
+      std::array<std::vector<uint8_t>, MAX_FEC_BLOCKS> subframe_block_buffers;
       // The client asks for at least 2 parity shards; PyroWave's critical block always has them.
       const std::size_t min_parity_shards = pyrowave_session ?
                                               std::max<std::size_t>(2, std::size_t(std::max(session->config.minRequiredFecPackets, 0))) :
@@ -2685,6 +2737,69 @@ namespace stream {
           offset += block.data_shards * blocksize;
           ++fec_blocks_needed;
         }
+      } else if (subframe_part) {
+        if (packet->subframe_part == 0) {
+          subframe.frame_index = packet->frame_index();
+          subframe.blocks_sent = 0;
+          subframe.first_part_ready = packet->subframe_ready;
+          subframe.pending.assign((uint8_t *) &frame_header, (uint8_t *) &frame_header + sizeof(frame_header));
+        }
+        subframe.pending.insert(std::end(subframe.pending), packet->data(), packet->data() + packet->data_size());
+
+        const std::size_t max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+        std::vector<std::size_t> block_sizes;
+        if (!packet->subframe_final) {
+          // Every packet names the frame's last block, so a frame that starts going out
+          // early always has all of them. The last one is kept for when the frame finishes.
+          fec_blocks_needed = video::subframe::blocks;
+          if (subframe.blocks_sent + 1 < video::subframe::blocks) {
+            const auto bytes = video::subframe::early_block_bytes(subframe.pending.size(), payload_blocksize, max_data_shards_per_fec_block);
+            if (bytes) {
+              block_sizes = {bytes};
+            }
+          }
+        } else {
+          if (subframe.blocks_sent == 0) {
+            // Nothing went out early, so the frame takes as many blocks as it needs like any other
+            const auto max_data_per_fec_block = max_data_shards_per_fec_block * payload_blocksize;
+            fec_blocks_needed = std::clamp<std::size_t>((subframe.pending.size() + max_data_per_fec_block - 1) / max_data_per_fec_block, 1, video::subframe::blocks);
+          } else {
+            fec_blocks_needed = video::subframe::blocks;
+          }
+          block_sizes = video::subframe::final_block_bytes(subframe.pending.size(), payload_blocksize, fec_blocks_needed - subframe.blocks_sent);
+        }
+
+        if (block_sizes.empty()) {
+          // Not a whole packet yet; it goes with the next part
+          continue;
+        }
+        if (!subframe.announced) {
+          subframe.announced = true;
+          BOOST_LOG(info) << "Sending video frames in parts while they encode"sv;
+        }
+
+        first_block = subframe.blocks_sent;
+        std::size_t offset = 0;
+        for (std::size_t x = 0; x < block_sizes.size(); ++x) {
+          // A block with nothing left to carry is one packet of zeros after the end of the frame
+          static const char zero_padding = 0;
+          const auto bytes = block_sizes[x];
+          const std::string_view data = bytes ? std::string_view {(char *) subframe.pending.data() + offset, bytes} : std::string_view {&zero_padding, 1};
+          subframe_block_buffers[x] = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, data, std::string_view {});
+
+          // FEC is left out of a block too large for it, as it is for a frame too large for it
+          const auto block_packets = (data.size() + payload_blocksize - 1) / payload_blocksize;
+          fec_blocks[first_block + x] = std::string_view {(char *) subframe_block_buffers[x].data(), subframe_block_buffers[x].size()};
+          fec_block_percentages[first_block + x] = block_packets > max_data_shards_per_fec_block ? 0 : fecPercentage;
+          if (block_packets > video::subframe::max_block_packets) {
+            BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << block_packets << " packets in one block)"sv;
+          }
+          subframe_part_shards += block_packets;
+          offset += bytes;
+        }
+        last_block = first_block + block_sizes.size();
+        subframe.blocks_sent = last_block;
+        subframe.pending.erase(std::begin(subframe.pending), std::begin(subframe.pending) + offset);
       } else {
         // The max number of data shards per block is found by solving this system of equations for D:
         // D = 255 - P
@@ -2731,16 +2846,19 @@ namespace stream {
       }
 
       decltype(fec_blocks)::iterator
-        fec_blocks_begin = std::begin(fec_blocks),
-        fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
+        fec_blocks_begin = std::begin(fec_blocks) + first_block,
+        fec_blocks_end = std::begin(fec_blocks) + (subframe_part ? last_block : fec_blocks_needed);
+      if (!subframe_part) {
+        last_block = fec_blocks_needed;
+      }
 
       // Both ordinary demand modes use this frame's actual FEC packet count.
       // The existing batch-only option preserves its deadline behavior; group
       // pacing is a separate opt-in so saved configurations remain compatible.
-      std::size_t pacing_frame_packets = total_shards;
+      std::size_t pacing_frame_packets = subframe_part ? subframe_part_shards : total_shards;
       if (!pyrowave_session && (config::stream.pacing_batch_demand_limit || config::stream.pacing_group_demand_limit)) {
         pacing_frame_packets = 0;
-        for (std::size_t x = 0; x < fec_blocks_needed; ++x) {
+        for (std::size_t x = first_block; x < last_block; ++x) {
           const auto data_shards = (fec_blocks[x].size() + blocksize - 1) / blocksize;
           pacing_frame_packets += pacing::fec_expanded_packets(data_shards, fec_block_percentages[x], min_parity_shards);
         }
@@ -2966,20 +3084,33 @@ namespace stream {
         // both lets a client trace distinguish a source gap from a frame held
         // after capture.
         bool frame_is_dupe = false;
-        if (!packet->frame_timestamp) {
-          packet->frame_timestamp = ratecontrol_next_frame_start;
-          frame_is_dupe = true;
-        }
+        uint32_t timestamp = 0;
+        if (subframe_part && packet->subframe_part > 0) {
+          // Every part of a frame carries the timestamp its first part went out with
+          frame_is_dupe = subframe.dupe;
+          packet->frame_timestamp = subframe.frame_timestamp;
+          timestamp = subframe.timestamp;
+        } else {
+          if (!packet->frame_timestamp) {
+            packet->frame_timestamp = ratecontrol_next_frame_start;
+            frame_is_dupe = true;
+          }
 #ifdef _WIN32
-        else {
-          // WGC composition times sit on the virtual display's refresh grid.
-          // Place the frame by the game's present cadence now that ETW has
-          // had the encode time to deliver those presents.
-          packet->frame_timestamp = platf::dxgi::present_timing::refine_send_timestamp(*packet->frame_timestamp);
-        }
+          else {
+            // WGC composition times sit on the virtual display's refresh grid.
+            // Place the frame by the game's present cadence now that ETW has
+            // had the encode time to deliver those presents.
+            packet->frame_timestamp = platf::dxgi::present_timing::refine_send_timestamp(*packet->frame_timestamp);
+          }
 #endif
-        using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
-        const uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
+          timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          if (subframe_part) {
+            subframe.dupe = frame_is_dupe;
+            subframe.frame_timestamp = packet->frame_timestamp;
+            subframe.timestamp = timestamp;
+          }
+        }
 
         // PyroWave record framing: flag the shards that start with a record, where a
         // client that lost a record header resumes parsing.
@@ -2996,7 +3127,7 @@ namespace stream {
         double burst_max_send_ms = 0.0;
         std::size_t burst_fallback_batches = 0;
 
-        auto blockIndex = 0;
+        auto blockIndex = (int) first_block;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
@@ -3219,6 +3350,17 @@ namespace stream {
           }
         }
 
+        if (subframe_part) {
+          if (!packet->subframe_final) {
+            // The frame is counted once its last part is sent
+            continue;
+          }
+          // How long the rest of the frame took, for the next frame's latency estimate
+          subframe.last_remaining = packet->subframe_ready - subframe.first_part_ready;
+          subframe.frame_index = -1;
+          subframe.pending.clear();
+        }
+
         const auto send_complete_timestamp = std::chrono::steady_clock::now();
 #ifdef __linux__
         {
@@ -3349,6 +3491,8 @@ namespace stream {
         // A failed frame is not a successful delivery. Keep the next frame's
         // sequence reservation, omit frame-success counters and avoid the generic
         // exception path's 100 ms sleep for temporary socket pressure.
+        // The rest of a frame being sent in parts is dropped.
+        subframe.frame_index = -1;
         if (!e.cancelled) {
           session->stats.video_send_failures.fetch_add(1, std::memory_order_relaxed);
           ++failed_video_frames;
@@ -3364,6 +3508,7 @@ namespace stream {
         }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
+        subframe.frame_index = -1;
         std::this_thread::sleep_for(100ms);
       }
     }

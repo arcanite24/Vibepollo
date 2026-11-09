@@ -54,6 +54,7 @@ extern "C" {
 #include "video_framerate_policy.h"
 #include "video_encoder_probe_policy.h"
 #include "video_policy.h"
+#include "video_subframe.h"
 #include "webrtc_stream.h"
 
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
@@ -1340,7 +1341,7 @@ namespace video {
       device->nvenc->set_hdr_metadata(metadata);
     }
 
-    nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index) {
+    nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index, const nvenc::nvenc_subframe_callback &on_subframe = {}) {
       if (!device || !device->nvenc) {
         return {};
       }
@@ -1349,7 +1350,7 @@ namespace video {
         return {};
       }
 
-      auto result = device->nvenc->encode_frame(frame_index, force_idr);
+      auto result = device->nvenc->encode_frame(frame_index, force_idr, on_subframe);
       force_idr = false;
       if (!result.data.empty() && result.frame_index != frame_index) {
         // Native NVENC has one synchronous input/output transaction. Delivering
@@ -3743,10 +3744,63 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
-    auto encoded_frame = session.encode_frame(frame_nr);
+    // With sub-frame readback (nvenc_subframe), groups of slices go to the network thread
+    // as they finish, while the rest is still encoding. See video_subframe.h. Encoder
+    // probes have no session and always get whole frames.
+    std::size_t bytes_sent = 0;
+    int parts_sent = 0;
+    std::uint32_t groups_sent = 0;
+    bool subframe_idr = false;
+    auto send_part = [&](const std::vector<uint8_t> &data, bool final, bool idr, bool after_ref_frame_invalidation) {
+      std::vector<uint8_t> part(std::begin(data) + bytes_sent, std::end(data));
+      bytes_sent = data.size();
+
+      auto packet = std::make_unique<packet_raw_generic>(std::move(part), frame_nr, idr);
+      packet->channel_data = channel_data;
+      packet->after_ref_frame_invalidation = after_ref_frame_invalidation;
+      packet->frame_timestamp = frame_timestamp;
+      packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+      packet->host_processing_timestamp = host_processing_timestamp;
+      packet->subframe_part = parts_sent++;
+      packet->subframe_final = final;
+      packet->subframe_ready = std::chrono::steady_clock::now();
+      packet->packet_enqueue_timestamp = packet->subframe_ready;
+      packets->raise(std::move(packet));
+    };
+    nvenc::nvenc_subframe_callback on_subframe;
+    if (channel_data) {
+      on_subframe = [&](const std::vector<uint8_t> &data, uint32_t slices_done, uint32_t slices_total, bool idr, bool after_ref_frame_invalidation) {
+        subframe_idr = idr;
+        // Groups that finished between polls go out together
+        const auto groups_done = subframe::parts_ready(slices_done, slices_total);
+        if (groups_done > groups_sent) {
+          groups_sent = groups_done;
+          send_part(data, false, idr, after_ref_frame_invalidation);
+        }
+      };
+    }
+
+    auto encoded_frame = session.encode_frame(frame_nr, on_subframe);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
+      // Parts already sent are dropped by the network thread once the next frame starts
       return -1;
+    }
+
+    if (parts_sent > 0) {
+      if (webrtc_stream::has_active_sessions()) {
+        // WebRTC takes whole frames
+        packet_raw_generic whole {std::vector<uint8_t> {encoded_frame.data}, (int64_t) encoded_frame.frame_index, subframe_idr};
+        whole.channel_data = channel_data;
+        whole.after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+        whole.frame_timestamp = frame_timestamp;
+        whole.capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+        whole.host_processing_timestamp = host_processing_timestamp;
+        webrtc_stream::submit_video_packet(whole);
+      }
+      // The type the first part went out with
+      send_part(encoded_frame.data, true, subframe_idr, encoded_frame.after_ref_frame_invalidation);
+      return 0;
     }
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);

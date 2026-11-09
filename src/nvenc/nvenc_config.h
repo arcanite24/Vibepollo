@@ -88,6 +88,9 @@ namespace nvenc {
 
     // Intra refresh for clients that doesn't request keyframe correctly
     bool intra_refresh = false;
+
+    // Send H.264/HEVC frames in parts as their slices finish encoding (sub-frame readback)
+    bool subframe_readback = false;
   };
 
 }  // namespace nvenc

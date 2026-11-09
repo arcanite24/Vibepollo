@@ -20,6 +20,7 @@ export const extendedDefaults: Record<string, unknown> = {
   nvenc_latency_over_power: 'enabled',
   nvenc_opengl_vulkan_on_dxgi: 'enabled',
   nvenc_h264_cavlc: 'disabled',
+  nvenc_subframe: 'disabled',
   qsv_preset: 'medium',
   qsv_coder: 'auto',
   qsv_slow_hevc: 'disabled',

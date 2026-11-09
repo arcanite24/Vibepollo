@@ -4165,6 +4165,35 @@ directly to the NVIDIA Video Codec SDK and is preferred during automatic probing
     </tr>
 </table>
 
+### nvenc_subframe
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Send H.264 and HEVC frames in parts while NVENC is still encoding them (sub-frame readback).
+            Each frame is encoded in at least 8 slices, and groups of finished slices go out as the
+            frame's FEC blocks (up to four), so sending overlaps encoding and the client receives the
+            frame sooner. Clients need no changes.
+            Enabling it turns off asynchronous encoding and split-frame encoding for the session.
+            @note{This option only applies to H.264 and HEVC with the NVENC [encoder](#encoder), on GPUs
+            that report sub-frame readback support. AV1 frames are always sent whole.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_subframe = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Intel QuickSync Encoder
 
 ### qsv_preset

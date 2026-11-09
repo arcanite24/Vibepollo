@@ -1808,6 +1808,7 @@ namespace config {
     generic_f(vars, "nvenc_twopass", video.nv.two_pass, nv::twopass_from_view);
     bool_f(vars, "nvenc_h264_cavlc", video.nv.h264_cavlc);
     bool_f(vars, "nvenc_intra_refresh", video.nv.intra_refresh);
+    bool_f(vars, "nvenc_subframe", video.nv.subframe_readback);
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
     bool_f(vars, "nvenc_latency_over_power", video.nv_sunshine_high_power_mode);
@@ -2833,6 +2834,7 @@ namespace config {
         "nvenc_latency_over_power",
         "nvenc_opengl_vulkan_on_dxgi",
         "nvenc_h264_cavlc",
+        "nvenc_subframe",
         "qsv_preset",
         "qsv_coder",
         "qsv_slow_hevc",

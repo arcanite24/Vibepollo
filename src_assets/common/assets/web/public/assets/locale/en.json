@@ -909,6 +909,8 @@
     "update_check_interval_desc": "How often Vibepollo should check for updates automatically (based on git tags). Set 0 to disable periodic checks.",
     "nvenc_h264_cavlc": "Prefer CAVLC over CABAC in H.264",
     "nvenc_h264_cavlc_desc": "Simpler form of entropy coding. CAVLC needs around 10% more bitrate for same quality. Only relevant for really old decoding devices.",
+    "nvenc_subframe": "Send frames while they encode (sub-frame readback)",
+    "nvenc_subframe_desc": "H.264 and HEVC frames are encoded in at least 8 slices and sent in up to four parts as the slices finish, so sending overlaps encoding. Disables asynchronous encoding and split-frame encoding. Works with stock clients; AV1 frames are always sent whole.",
     "nvenc_latency_over_power": "Prefer lower encoding latency over power savings",
     "nvenc_latency_over_power_desc": "Vibepollo requests maximum GPU clock speed while streaming to reduce encoding latency. Disabling it is not recommended since this can lead to significantly increased encoding latency.",
     "nvenc_opengl_vulkan_on_dxgi": "Present OpenGL/Vulkan on top of DXGI",

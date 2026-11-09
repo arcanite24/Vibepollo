@@ -130,6 +130,7 @@ export const clientOverrideableKeys = new Set([
   'nvenc_latency_over_power',
   'nvenc_opengl_vulkan_on_dxgi',
   'nvenc_h264_cavlc',
+  'nvenc_subframe',
   'qsv_preset',
   'qsv_coder',
   'qsv_slow_hevc',

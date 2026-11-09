@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <thread>
 
 // Make sure we check backwards compatibility when bumping the Video Codec SDK version
 // Things to look out for:
@@ -27,6 +28,7 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/utility.h"
+#include "src/video_subframe.h"
 
 namespace {
 
@@ -473,6 +475,34 @@ namespace nvenc {
     };
     const auto encoder_engine_count = get_encoder_cap(NV_ENC_CAPS_NUM_ENCODER_ENGINES);
 
+    encoder_params.async = init_params.enableEncodeAsync != 0;
+    encoder_params.subframe = false;
+    encoder_params.slices = static_cast<uint32_t>(std::max(client_config.slicesPerFrame, 1));
+    if (config.subframe_readback) {
+      // The frame header goes out with the first part, before the frame's size is known, which
+      // only H.264 and HEVC decoders tolerate.
+      if (client_config.videoFormat != 0 && client_config.videoFormat != 1) {
+        BOOST_LOG(info) << "NvEnc: sub-frame readback is only used for H.264 and HEVC";
+      } else if (!get_encoder_cap(NV_ENC_CAPS_SUPPORT_SUBFRAME_READBACK)) {
+        BOOST_LOG(warning) << "NvEnc: gpu doesn't support sub-frame readback";
+      } else {
+        if (!poll_timer) {
+          poll_timer = platf::create_high_precision_timer();
+        }
+
+        // Slices are reported only by a synchronous encoder
+        encoder_params.subframe = true;
+        encoder_params.async = false;
+        encoder_params.slices = std::max<uint32_t>(encoder_params.slices, video::subframe::min_slices);
+        init_params.enableEncodeAsync = 0;
+        init_params.enableSubFrameWrite = 1;
+        init_params.reportSliceOffsets = 1;
+
+        // NV_ENC_LOCK_BITSTREAM::sliceOffsets must have an entry for every 16x16 macroblock
+        slice_offsets.assign(((encoder_params.width + 15) / 16) * ((encoder_params.height + 15) / 16), 0);
+      }
+    }
+
     NV_ENC_CONFIG enc_config {};
     if (have_preset_config) {
       enc_config = preset_config.presetCfg;
@@ -505,7 +535,7 @@ namespace nvenc {
       format_config.repeatSPSPPS = 1;
       format_config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
       format_config.sliceMode = 3;
-      format_config.sliceModeData = client_config.slicesPerFrame;
+      format_config.sliceModeData = encoder_params.slices;
       format_config.chromaFormatIDC = buffer_is_yuv444() ? 3 : 1;
       format_config.enableFillerDataInsertion = config.insert_filler_data;
     };
@@ -712,7 +742,15 @@ namespace nvenc {
 
     std::string split_frame_status = "split-frame=n/a";
     if (client_config.videoFormat == 1 || client_config.videoFormat == 2) {
-      if (!api::supports_implicit_split_frame(selected_api_version)) {
+      if (encoder_params.subframe) {
+        // Split-frame encoding cannot be combined with sub-frame readback
+#if NVENCAPI_MAJOR_VERSION > 12 || (NVENCAPI_MAJOR_VERSION == 12 && NVENCAPI_MINOR_VERSION >= 1)
+        if (api::supports_implicit_split_frame(selected_api_version)) {
+          init_params.splitEncodeMode = NV_ENC_SPLIT_DISABLE_MODE;
+        }
+#endif
+        split_frame_status = "split-frame=disabled(subframe)";
+      } else if (!api::supports_implicit_split_frame(selected_api_version)) {
         split_frame_status = "split-frame=disabled(api<12.1)";
       } else if (client_config.videoFormat == 1 && init_params.enableWeightedPrediction) {
         split_frame_status = "split-frame=disabled(weighted-prediction)";
@@ -809,7 +847,7 @@ namespace nvenc {
     current_enc_config = enc_config;
     saved_init_params.encodeConfig = &current_enc_config;
 
-    if (async_event_handle) {
+    if (encoder_params.async) {
       NV_ENC_EVENT_PARAMS event_params = {api::event_params_version(selected_api_version)};
       event_params.completionEvent = async_event_handle;
       if (nvenc_failed(nvenc->nvEncRegisterAsyncEvent(encoder, &event_params))) {
@@ -839,6 +877,9 @@ namespace nvenc {
       extra += std::format(" api={}", api::version_string(selected_api_version));
       if (init_params.enableEncodeAsync) {
         extra += " async";
+      }
+      if (encoder_params.subframe) {
+        extra += std::format(" subframe({} slices)", encoder_params.slices);
       }
       if (buffer_is_yuv444()) {
         extra += " yuv444";
@@ -897,7 +938,7 @@ namespace nvenc {
       }
       output_bitstream = nullptr;
     }
-    if (encoder && async_event_handle) {
+    if (encoder && encoder_params.async && async_event_handle) {
       NV_ENC_EVENT_PARAMS event_params = {api::event_params_version(selected_api_version)};
       event_params.completionEvent = async_event_handle;
       if (nvenc_failed(nvenc->nvEncUnregisterAsyncEvent(encoder, &event_params))) {
@@ -937,7 +978,7 @@ namespace nvenc {
                     << " nits, MaxFALL " << metadata.maxFrameAverageLightLevel << " nits)";
   }
 
-  nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
+  nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr, const nvenc_subframe_callback &on_subframe) {
     const auto encode_started = std::chrono::steady_clock::now();
     auto latency_guard = util::fail_guard([&] {
       encoder_state.encode_latency_logger.collect_and_log(
@@ -985,7 +1026,7 @@ namespace nvenc {
     pic_params.inputBuffer = mapped_input_buffer.mappedResource;
     pic_params.bufferFmt = mapped_input_buffer.mappedBufferFmt;
     pic_params.outputBitstream = output_bitstream;
-    pic_params.completionEvent = async_event_handle;
+    pic_params.completionEvent = encoder_params.async ? async_event_handle : nullptr;
 
 #if NVENCAPI_MAJOR_VERSION >= 13
     CONTENT_LIGHT_LEVEL content_light_level {};
@@ -1040,27 +1081,40 @@ namespace nvenc {
       return {};
     }
 
-    NV_ENC_LOCK_BITSTREAM lock_bitstream = {api::lock_bitstream_version(selected_api_version)};
-    lock_bitstream.outputBitstream = output_bitstream;
-    lock_bitstream.doNotWait = async_event_handle ? 1 : 0;
+    nvenc_encoded_frame encoded_frame;
+    encoded_frame.after_ref_frame_invalidation = encoder_state.rfi_needs_confirmation;
 
-    if (async_event_handle && !wait_for_async_event(100)) {
-      BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode completion wait unsuccessful";
-      return {};
+    if (encoder_params.subframe) {
+      // A frame's type goes out with its first part, so it must be known before encoding. With
+      // no automatic IDR frames, a frame is IDR when one is forced and for the first frame.
+      const bool idr = force_idr || !encoder_state.first_frame_encoded;
+      if (!read_bitstream_in_slices(frame_index, encoded_frame, on_subframe, idr)) {
+        return {};
+      }
+    } else {
+      NV_ENC_LOCK_BITSTREAM lock_bitstream = {api::lock_bitstream_version(selected_api_version)};
+      lock_bitstream.outputBitstream = output_bitstream;
+      lock_bitstream.doNotWait = encoder_params.async ? 1 : 0;
+
+      if (encoder_params.async && !wait_for_async_event(100)) {
+        BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode completion wait unsuccessful";
+        return {};
+      }
+
+      if (nvenc_failed(nvenc->nvEncLockBitstream(encoder, &lock_bitstream))) {
+        BOOST_LOG(error) << "NvEnc: NvEncLockBitstream() failed: " << last_nvenc_error_string;
+        return {};
+      }
+
+      auto data_pointer = (uint8_t *) lock_bitstream.bitstreamBufferPtr;
+      encoded_frame.data.assign(data_pointer, data_pointer + lock_bitstream.bitstreamSizeInBytes);
+      encoded_frame.frame_index = lock_bitstream.outputTimeStamp;
+      encoded_frame.idr = lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR;
+
+      if (nvenc_failed(nvenc->nvEncUnlockBitstream(encoder, lock_bitstream.outputBitstream))) {
+        BOOST_LOG(error) << "NvEnc: NvEncUnlockBitstream() failed: " << last_nvenc_error_string;
+      }
     }
-
-    if (nvenc_failed(nvenc->nvEncLockBitstream(encoder, &lock_bitstream))) {
-      BOOST_LOG(error) << "NvEnc: NvEncLockBitstream() failed: " << last_nvenc_error_string;
-      return {};
-    }
-
-    auto data_pointer = (uint8_t *) lock_bitstream.bitstreamBufferPtr;
-    nvenc_encoded_frame encoded_frame {
-      {data_pointer, data_pointer + lock_bitstream.bitstreamSizeInBytes},
-      lock_bitstream.outputTimeStamp,
-      lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR,
-      encoder_state.rfi_needs_confirmation,
-    };
 
     if (encoder_state.rfi_needs_confirmation) {
       // Invalidation request has been fulfilled, and video network packet will be marked as such
@@ -1068,18 +1122,96 @@ namespace nvenc {
     }
 
     encoder_state.last_encoded_frame_index = frame_index;
+    encoder_state.first_frame_encoded = true;
 
     if (encoded_frame.idr) {
       BOOST_LOG(debug) << "NvEnc: idr frame " << encoded_frame.frame_index;
     }
 
-    if (nvenc_failed(nvenc->nvEncUnlockBitstream(encoder, lock_bitstream.outputBitstream))) {
-      BOOST_LOG(error) << "NvEnc: NvEncUnlockBitstream() failed: " << last_nvenc_error_string;
-    }
-
     encoder_state.frame_size_logger.collect_and_log(encoded_frame.data.size() / 1000.);
 
     return encoded_frame;
+  }
+
+  bool nvenc_base::read_bitstream_in_slices(uint64_t frame_index, nvenc_encoded_frame &encoded_frame, const nvenc_subframe_callback &on_subframe, bool idr) {
+    using namespace std::chrono_literals;
+
+    // Give up after as long as the asynchronous path waits for a frame
+    const auto deadline = std::chrono::steady_clock::now() + 100ms;
+    uint32_t slices_reported = 0;
+    bool streamable = true;
+
+    // Between polls. Slices of a frame encoded in a few milliseconds finish a fraction of a
+    // millisecond apart.
+    auto wait = [&]() {
+      if (poll_timer && *poll_timer) {
+        poll_timer->sleep_for(100us);
+      } else {
+        std::this_thread::yield();
+      }
+    };
+
+    while (true) {
+      NV_ENC_LOCK_BITSTREAM lock_bitstream = {api::lock_bitstream_version(selected_api_version)};
+      lock_bitstream.outputBitstream = output_bitstream;
+      lock_bitstream.doNotWait = 1;
+      lock_bitstream.sliceOffsets = slice_offsets.data();
+
+      const auto status = nvenc->nvEncLockBitstream(encoder, &lock_bitstream);
+      if (status == NV_ENC_ERR_LOCK_BUSY) {
+        // Nothing to read yet
+        if (std::chrono::steady_clock::now() > deadline) {
+          BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
+          return false;
+        }
+        wait();
+        continue;
+      }
+      if (nvenc_failed(status)) {
+        BOOST_LOG(error) << "NvEnc: NvEncLockBitstream() failed: " << last_nvenc_error_string;
+        return false;
+      }
+
+      // Finished slices never change, so only what is new is copied
+      const auto size = lock_bitstream.bitstreamSizeInBytes;
+      if (size > encoded_frame.data.size()) {
+        auto data_pointer = (uint8_t *) lock_bitstream.bitstreamBufferPtr;
+        encoded_frame.data.insert(std::end(encoded_frame.data), data_pointer + encoded_frame.data.size(), data_pointer + size);
+      }
+      encoded_frame.frame_index = lock_bitstream.outputTimeStamp;
+      encoded_frame.idr = lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR;
+
+      // NVENC reports 2 once the whole frame is encoded. Slices are the last thing in the
+      // bitstream, so all of them being done means the same, should a driver not report it.
+      const auto slices_done = lock_bitstream.numSlices;
+      const bool complete = lock_bitstream.hwEncodeStatus == 2 || slices_done >= encoder_params.slices;
+
+      if (nvenc_failed(nvenc->nvEncUnlockBitstream(encoder, lock_bitstream.outputBitstream))) {
+        BOOST_LOG(error) << "NvEnc: NvEncUnlockBitstream() failed: " << last_nvenc_error_string;
+      }
+
+      if (complete) {
+        return true;
+      }
+
+      // An IDR frame nobody asked for could not be labelled in its first part, so it is sent
+      // whole. The picture type may not be reported until the frame is done, so it only counts
+      // when it does say IDR.
+      if (encoded_frame.idr && !idr) {
+        streamable = false;
+      }
+
+      if (on_subframe && streamable && slices_done > slices_reported) {
+        slices_reported = slices_done;
+        on_subframe(encoded_frame.data, slices_done, encoder_params.slices, idr, encoded_frame.after_ref_frame_invalidation);
+      }
+
+      if (std::chrono::steady_clock::now() > deadline) {
+        BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
+        return false;
+      }
+      wait();
+    }
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {

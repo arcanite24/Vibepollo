@@ -67,9 +67,17 @@ namespace nvenc {
      *        Afterwards serves as parameter for `invalidate_ref_frames()`.
      *        No restrictions on the first frame index, but later frame indexes must be subsequent.
      * @param force_idr Whether to encode frame as forced IDR.
+     * @param on_subframe Optional. Called as slices finish when sub-frame readback is enabled.
      * @return Encoded frame.
      */
-    nvenc_encoded_frame encode_frame(uint64_t frame_index, bool force_idr);
+    nvenc_encoded_frame encode_frame(uint64_t frame_index, bool force_idr, const nvenc_subframe_callback &on_subframe = {});
+
+    /**
+     * @brief Whether frames are read back slice by slice as they encode.
+     */
+    bool subframe_readback_enabled() const {
+      return encoder_params.subframe;
+    }
 
     /**
      * @brief Perform reference frame invalidation (RFI) procedure.
@@ -175,6 +183,9 @@ namespace nvenc {
       int video_format = -1;
       uint32_t ref_frames_in_dpb = 0;
       bool rfi = false;
+      bool async = false;  ///< Whether the encoder runs asynchronously, which sub-frame readback rules out.
+      bool subframe = false;  ///< Whether slices are read back as they finish. See `read_bitstream_in_slices()`.
+      uint32_t slices = 1;  ///< Slices per frame for H.264 and HEVC.
     } encoder_params;
 
     std::string last_nvenc_error_string;
@@ -192,11 +203,24 @@ namespace nvenc {
     NVENCSTATUS last_nvenc_status = NV_ENC_SUCCESS;
 
   private:
+    /**
+     * @brief Read a frame's bitstream as its slices finish, for sub-frame readback.
+     * @param frame_index Frame being encoded, for logging.
+     * @param encoded_frame Receives the frame.
+     * @param on_subframe Called each time more slices are done, unless empty.
+     * @param idr Whether the frame was submitted as IDR.
+     * @return `true` once the whole frame is read, `false` on error or timeout.
+     */
+    bool read_bitstream_in_slices(uint64_t frame_index, nvenc_encoded_frame &encoded_frame, const nvenc_subframe_callback &on_subframe, bool idr);
+
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
+    std::vector<uint32_t> slice_offsets;  ///< Receives slice offsets during sub-frame readback, one entry per macroblock as the API requires.
+    std::unique_ptr<platf::high_precision_timer> poll_timer;  ///< Paces polling during sub-frame readback.
 
     struct {
       uint64_t last_encoded_frame_index = 0;
       bool rfi_needs_confirmation = false;
+      bool first_frame_encoded = false;  ///< Whether a frame has been encoded since the encoder was created. The first is always IDR.
       std::pair<uint64_t, uint64_t> last_rfi_range;
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
       logging::min_max_avg_periodic_logger<double> encode_latency_logger = {debug, "NvEnc: native encode call latency", "ms"};

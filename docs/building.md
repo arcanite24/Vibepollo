@@ -199,6 +199,7 @@ dependencies=(
   "mingw-w64-${TOOLCHAIN}-libpng"
   "mingw-w64-${TOOLCHAIN}-libwebp"
   "mingw-w64-${TOOLCHAIN}-miniupnpc"
+  "mingw-w64-${TOOLCHAIN}-nlohmann-json"
   "mingw-w64-${TOOLCHAIN}-onevpl"
   "mingw-w64-${TOOLCHAIN}-openssl"
   "mingw-w64-${TOOLCHAIN}-opus"

@@ -547,6 +547,34 @@ sunshine_add_test_target(
 )
 
 sunshine_add_test_target(
+    NAME test_fast_nvenc_log_flags
+    CATEGORY fast
+    TEST_SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/tests_main.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/unit/test_nvenc_log_flags.cpp"
+    PRODUCT_SOURCES
+    DEFINITIONS
+    INCLUDE_DIRECTORIES
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party/nv-codec-headers/include"
+    LINK_LIBRARIES GTest::gtest
+    DEPENDENCIES
+)
+
+sunshine_add_test_target(
+    NAME test_fast_nvenc_intra_refresh
+    CATEGORY fast
+    TEST_SOURCES
+        "${CMAKE_CURRENT_LIST_DIR}/tests_main.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/unit/test_nvenc_intra_refresh.cpp"
+    PRODUCT_SOURCES
+    DEFINITIONS
+    INCLUDE_DIRECTORIES
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party/nv-codec-headers/include"
+    LINK_LIBRARIES GTest::gtest
+    DEPENDENCIES
+)
+
+sunshine_add_test_target(
     NAME test_component_nvenc_event_wait
     CATEGORY component
     TEST_SOURCES
@@ -727,7 +755,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         LINK_LIBRARIES Boost::asio)
 endif()
 sunshine_register_component(NAME test_component_hdr_request_policy TEST_SOURCE unit/test_hdr_request_policy.cpp)
+sunshine_register_component(NAME test_component_client_hdr_peak TEST_SOURCE unit/test_client_hdr_peak.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/client_hdr_peak.cpp")
 sunshine_register_component(NAME test_component_single_flight TEST_SOURCE unit/test_single_flight.cpp)
+sunshine_register_component(NAME test_component_video_subframe TEST_SOURCE unit/test_video_subframe.cpp)
 sunshine_register_component(NAME test_component_paused_app_monitor TEST_SOURCE unit/test_paused_app_monitor.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/power_action.cpp"
     LINK_LIBRARIES Threads::Threads Boost::property_tree OpenSSL::Crypto)
@@ -1460,6 +1491,10 @@ endif()
 sunshine_register_component(NAME test_component_present_timing_policy TEST_SOURCE unit/test_present_timing_policy.cpp)
 sunshine_register_component(NAME test_component_video_adaptive_pacing TEST_SOURCE unit/test_video_adaptive_pacing.cpp)
 sunshine_register_component(NAME test_component_video_fec_status TEST_SOURCE unit/test_video_fec_status.cpp)
+sunshine_register_component(NAME test_component_video_link_rate TEST_SOURCE unit/test_video_link_rate.cpp)
+if(TARGET test_component_video_link_rate)
+    set_tests_properties(test_component_video_link_rate PROPERTIES TIMEOUT 300)
+endif()
 sunshine_register_component(NAME test_component_encoder_probe_policy TEST_SOURCE unit/test_encoder_probe_policy.cpp)
 sunshine_register_component(NAME test_component_gpu_priority_lifetime
     TEST_SOURCE unit/platform/windows/test_gpu_priority_lifetime.cpp)

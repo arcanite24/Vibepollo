@@ -84,12 +84,24 @@ AVRational framerateX100_to_rational(int value) {
   auto rate = policy::framerate_x100_to_rational(value);
   return {rate.numerator, rate.denominator};
 }
+template<class Config> bool has_exact_framerate(const Config &config) {
+  return config.framerateUhz > 0 || config.framerateX100 > 0;
+}
+template<class Config> AVRational exact_framerate_to_rational(const Config &config) {
+  if (config.framerateUhz > 0) {
+    auto rate = policy::framerate_uhz_to_rational(config.framerateUhz);
+    return {rate.numerator, rate.denominator};
+  }
+  if (config.framerateX100 > 0) return framerateX100_to_rational(config.framerateX100);
+  return {config.framerate, 1};
+}
 }
 #define BOOST_LOG(level) std::cerr
 struct config_t {
   int framerate = 30;
   int framerateX100 = 0;
   int encodingFramerate = 30000;
+  int framerateUhz = 0;
   int width = 1920;
   video::capture_source_e capture_source = video::capture_source_e::active_output;
 };

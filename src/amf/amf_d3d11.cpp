@@ -188,8 +188,8 @@ namespace amf {
     const video::sunshine_colorspace_t &colorspace) {
     auto bitrate = static_cast<int64_t>(client_config.bitrate) * 1000;
     AVRational fps {client_config.framerate > 0 ? client_config.framerate : 60, 1};
-    if (client_config.framerateX100 > 0) {
-      fps = video::framerateX100_to_rational(client_config.framerateX100);
+    if (video::has_exact_framerate(client_config)) {
+      fps = video::exact_framerate_to_rational(client_config);
     }
     auto framerate = AMFConstructRate(fps.num, fps.den);
     // Cap the VBV/HRD buffer at ~1 frame of bits, matching FFmpeg's amfenc
@@ -2770,8 +2770,8 @@ namespace amf {
     // Keep the VBV at ~1 frame of bits on dynamic bitrate changes too, so a raised
     // bitrate can't start producing FEC-overflowing frames (see configure_encoder).
     AVRational fps {current_config.framerate > 0 ? current_config.framerate : 60, 1};
-    if (current_config.framerateX100 > 0) {
-      fps = video::framerateX100_to_rational(current_config.framerateX100);
+    if (video::has_exact_framerate(current_config)) {
+      fps = video::exact_framerate_to_rational(current_config);
     }
     const int64_t vbv_buffer_size = fps.num > 0 ? (bitrate * fps.den / fps.num) : bitrate;
     bool success = true;

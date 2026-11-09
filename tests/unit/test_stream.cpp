@@ -37,6 +37,47 @@ namespace {
   constexpr auto haptics_time = std::chrono::steady_clock::time_point {};
 }  // namespace
 
+TEST(SessionFecPercentageTests, UsesTheHostsWhenTheClientDoesNotAsk) {
+  EXPECT_EQ(stream::session_fec_percentage(-1, 20), 20);
+}
+
+TEST(SessionFecPercentageTests, UsesTheClientsRequest) {
+  EXPECT_EQ(stream::session_fec_percentage(5, 20), 5);
+  EXPECT_EQ(stream::session_fec_percentage(255, 20), 255);
+}
+
+TEST(SessionFecPercentageTests, AllowsTheClientToTurnFecOff) {
+  EXPECT_EQ(stream::session_fec_percentage(0, 20), 0);
+}
+
+TEST(SessionFecPercentageTests, IgnoresRequestsAboveTheHostsRange) {
+  EXPECT_EQ(stream::session_fec_percentage(256, 20), 20);
+}
+
+TEST(SessionVideoSendRateTests, UsesTheHostsWhenTheClientDoesNotAsk) {
+  EXPECT_EQ(stream::session_video_send_rate(0, 800), 800);
+}
+
+TEST(SessionVideoSendRateTests, UsesTheClientsRequest) {
+  EXPECT_EQ(stream::session_video_send_rate(100, 800), 100);
+  EXPECT_EQ(stream::session_video_send_rate(400, 800), 400);
+  EXPECT_EQ(stream::session_video_send_rate(100000, 800), 100000);
+}
+
+TEST(SessionVideoSendRateTests, IgnoresRequestsOutsideTheRange) {
+  EXPECT_EQ(stream::session_video_send_rate(99, 800), 800);
+  EXPECT_EQ(stream::session_video_send_rate(100001, 800), 800);
+}
+
+TEST(SessionVideoSendRateTests, DefaultMatchesTheLegacyFixedPace) {
+  // The pacer always sent 80% of gigabit: giga * 80 / 100 / 1000 / blocksize / 8.
+  for (std::size_t blocksize : {1040u, 1408u, 1416u}) {
+    EXPECT_EQ(stream::video_send_rate_packets_per_ms(stream::DEFAULT_VIDEO_SEND_RATE_MBPS, blocksize),
+              std::max<std::size_t>(1, std::size_t(1'000'000'000) * 80 / 100 / 1000 / blocksize / 8));
+  }
+  EXPECT_EQ(stream::video_send_rate_packets_per_ms(400, 1416), 35u);
+}
+
 TEST(HapticsGain, UnityPreservesEverySampleBit) {
   auto packet = haptics_packet(-32768, 32767);
   set_haptics_sample(packet, 2, -1);

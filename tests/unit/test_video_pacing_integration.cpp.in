@@ -44,6 +44,8 @@ struct config_t {
                framerate = 120, encodingFramerate = 120000, framerateX100 = 12000;
            bool input_only = false; } monitor;
   int packetsize = 1392, encryptionFlagsEnabled = 0, minRequiredFecPackets = 2;
+  // Session-negotiated values; these defaults equal what clients that don't ask get.
+  int fecPercentage = 20, sendRateMbps = stream::DEFAULT_VIDEO_SEND_RATE_MBPS;
 };
 struct session_t;
 struct control_server_t { sync_util::sync_t<std::vector<session_t *>> _sessions; };
@@ -76,6 +78,7 @@ using stream::reserve_video_pacing_capacity;
 @RATE_HELPERS@
 #endif
 using stream::video_send_batch_size;
+using stream::video_send_rate_packets_per_ms;
 @HELPERS@
 // Only the native session representation is adapted. Matching, acquisition,
 // callback ordering, metadata writes and publication are the real component.

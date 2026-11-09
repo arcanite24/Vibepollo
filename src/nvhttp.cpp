@@ -44,6 +44,7 @@
 // local includes
 #include "app_display_policy.h"
 #include "audio.h"
+#include "client_hdr_peak.h"
 #include "config.h"
 #include "confighttp.h"
 #include "host_stream_control.h"
@@ -2286,6 +2287,50 @@ namespace nvhttp {
       return it->second;
     }
 
+    void apply_automatic_hdr_peak(
+      std::unordered_map<std::string, std::string> &overrides,
+      const args_t &args,
+      const std::optional<crypto::named_cert_t> &client_settings,
+      const std::optional<bool> app_prefer_sdr_10bit
+    ) {
+      if (overrides.contains("rtx_hdr_peak_brightness")) {
+        return;
+      }
+
+      std::optional<std::uint32_t> profile_peak;
+#ifdef _WIN32
+      if (client_settings && !client_settings->hdr_profile.empty()) {
+        profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile);
+      }
+#endif
+      const bool client_hdr_requested = get_arg(args, "hdrMode", "0") == "1";
+      const auto requested_override = overrides.find("dd_hdr_request_override");
+      const auto hdr_request = client_hdr_peak::effective_request(
+        client_hdr_requested,
+        client_settings && client_settings->prefer_10bit_sdr,
+        app_prefer_sdr_10bit,
+        config::base_hdr_request_override(),
+        requested_override != overrides.end() ?
+          std::optional<std::string_view> {requested_override->second} : std::nullopt
+      );
+      const auto calibrated = get_arg(args, "clientHdrPeakCalibrated", "");
+      const auto reported = get_arg(args, "clientHdrPeakEdid", "");
+      if (const auto peak = client_hdr_peak::resolve({
+            false,
+            profile_peak,
+            client_hdr_requested,
+            rtsp_stream::effective_hdr_requested(hdr_request.enable_hdr, hdr_request.prefer_sdr_10bit, hdr_request.force_sdr),
+            calibrated,
+            reported,
+          })) {
+        overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(peak->peak_nits));
+        const auto source = peak->source == client_hdr_peak::source_e::host_profile ? "assigned host MHC2 profile" :
+                            peak->source == client_hdr_peak::source_e::calibrated ? "client ICC/MHC2 calibration" :
+                                                                                   "client DXGI/EDID display report";
+        BOOST_LOG(info) << "HDR peak: using " << peak->peak_nits << " nits from " << source << ".";
+      }
+    }
+
 
     // Helper function to extract command entries from a JSON object.
     cmd_list_t extract_command_entries(const nlohmann::json &j, const std::string &key) {
@@ -4235,6 +4280,8 @@ namespace nvhttp {
 
       tree.put("root.appversion", VERSION);
       tree.put("root.GfeVersion", GFE_VERSION);
+      // Clients send the integer HDR peak extension only for this advertised version.
+      tree.put("root.ClientHdrPeakVersion", 1);
       tree.put("root.uniqueid", http::unique_id);
       tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
       tree.put("root.HardwareMetricsVersion", metrics_supported ? 1 : 0);
@@ -5150,18 +5197,9 @@ namespace nvhttp {
         if (no_active_sessions) {
           try {
             auto overrides = requested_runtime_overrides;
-#ifdef _WIN32
-            if (client_settings &&
-                !client_settings->hdr_profile.empty() &&
-                !overrides.contains("rtx_hdr_peak_brightness")) {
-              if (const auto profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile)) {
-                overrides.insert_or_assign(
-                  "rtx_hdr_peak_brightness",
-                  std::to_string(std::clamp<std::uint32_t>(*profile_peak, 400, 2000))
-                );
-              }
-            }
-#endif
+            // These roles intentionally use device color preferences, matching
+            // make_launch_session_from_snapshot(..., use_app_color_preference=false).
+            apply_automatic_hdr_peak(overrides, args, client_settings, std::nullopt);
             config::set_runtime_config_overrides(std::move(overrides));
             runtime_overrides_applied = true;
             config::apply_config_now();
@@ -5500,33 +5538,10 @@ launch_session->exact_target_hold.reset();
       if (update_runtime_overrides) {
         try {
           auto overrides = requested_runtime_overrides;
-
-#ifdef _WIN32
-          // "Auto" client peak brightness follows the selected Windows HDR calibration
-          // profile's MHC2 peak. An explicit app/client override remains authoritative.
-          if (client_settings &&
-              !client_settings->hdr_profile.empty() &&
-              !overrides.contains("rtx_hdr_peak_brightness")) {
-            if (const auto profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile)) {
-              const auto effective_peak = std::clamp<std::uint32_t>(*profile_peak, 400, 2000);
-              overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(effective_peak));
-              if (dispatch::include_request_identity_log_fields(trace_id)) {
-                BOOST_LOG(info) << "HDR peak: using " << effective_peak << " nits from MHC2 profile '"
-                                << client_settings->hdr_profile << "'"
-                                << (*profile_peak == effective_peak ? "." : " (clamped to supported range).");
-              } else {
-                BOOST_LOG(info) << "HDR peak: using the paired client's selected calibration profile.";
-              }
-            } else {
-              if (dispatch::include_request_identity_log_fields(trace_id)) {
-                BOOST_LOG(warning) << "HDR peak: profile '" << client_settings->hdr_profile
-                                   << "' has no readable MHC2 peak; using the configured default.";
-              } else {
-                BOOST_LOG(warning) << "HDR peak: the paired client's selected calibration profile is unreadable; using the configured default.";
-              }
-            }
-          }
-#endif
+          apply_automatic_hdr_peak(
+            overrides, args, client_settings,
+            requested_app ? requested_app->prefer_10bit_sdr : std::nullopt
+          );
 
           config::set_runtime_config_overrides(std::move(overrides));
           runtime_overrides_applied = true;
@@ -6116,7 +6131,8 @@ launch_session->exact_target_hold.reset();
       );
 
     std::unordered_map<std::string, std::string> requested_runtime_overrides;
-    if (auto running_app = proc::proc.resolve_app(current_appid)) {
+    const auto running_app = proc::proc.resolve_app(current_appid);
+    if (running_app) {
       config::merge_config_overrides(requested_runtime_overrides, running_app->config_overrides);
     }
 
@@ -6132,17 +6148,6 @@ launch_session->exact_target_hold.reset();
     if (client_settings) {
       config::merge_config_overrides(requested_runtime_overrides, client_settings->config_overrides);
     }
-
-#ifdef _WIN32
-    if (client_settings &&
-        !client_settings->hdr_profile.empty() &&
-        !requested_runtime_overrides.contains("rtx_hdr_peak_brightness")) {
-      if (const auto profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile)) {
-        const auto effective_peak = std::clamp<std::uint32_t>(*profile_peak, 400, 2000);
-        requested_runtime_overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(effective_peak));
-      }
-    }
-#endif
 
     if (!no_active_sessions &&
         !config::adapter_config_overrides_compatible_with_active(requested_runtime_overrides)) {
@@ -6171,6 +6176,10 @@ launch_session->exact_target_hold.reset();
     });
 
     if (no_active_sessions && !secondary_game_client) {
+      apply_automatic_hdr_peak(
+        requested_runtime_overrides, args, client_settings,
+        running_app ? running_app->prefer_10bit_sdr : std::nullopt
+      );
       config::set_runtime_config_overrides(std::move(requested_runtime_overrides));
       config::apply_config_now(std::ref(request_audio_hold));
       runtime_overrides_reapplied = true;
@@ -7030,9 +7039,11 @@ launch_session->exact_target_hold.reset();
       return;
     }
 
-    // Server-side adaptive bitrate decisioning is not implemented. Reporting it unsupported makes
-    // Foundation-compatible clients (e.g. Moonlight V+) drive their own local ABR controller, which
-    // applies decisions through the runtime /bitrate endpoint above.
+    // Foundation's server-side adaptive bitrate protocol is not implemented. Reporting it unsupported
+    // makes Foundation-compatible clients (e.g. Moonlight V+) drive their own local ABR controller,
+    // which applies decisions through the runtime /bitrate endpoint above. The optional host link rate
+    // controller (host_link_rate_adaptation) needs no client support and steps aside for the rest of
+    // the stream at the client's first /bitrate change.
     const std::string body = R"({"supported":false,"version":1,"features":["runtime_bitrate"]})";
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");

@@ -75,8 +75,10 @@ extern "C" {
 #include "utility.h"
 #include "uuid.h"
 #include "video_send.h"
+#include "video_subframe.h"
 #include "video_adaptive_pacing.h"
 #include "video_fec_status.h"
+#include "video_link_rate.h"
 #include "video_pacing_policy.h"
 #include "webrtc_stream.h"
 #ifdef _WIN32
@@ -518,7 +520,48 @@ namespace stream {
     AUDIO_FEC_HEADER fecHeader;
   };
 
+  /**
+   * @brief Clock sync request a client sends to the video port.
+   *
+   * @details Wire-compatible with MoreOrLessSoftware/Sunshine and the moonlight-common-c clock
+   *          sync (SS_CLOCK_SYNC_REQUEST). It starts like a ping, so hosts that don't know it treat
+   *          it as one. The host answers with clock_sync_reply_t, from which the client works out
+   *          the offset between its clock and the host's RTP video timestamps, NTP-style. Clients
+   *          stop sending these when no reply comes, so stock clients never see a reply.
+   */
+  struct clock_sync_request_t {
+    char payload[16];  ///< The session's video ping payload, which identifies it.
+    boost::endian::little_uint32_at magic;  ///< CLOCK_SYNC_REQUEST_MAGIC.
+    boost::endian::little_uint32_at sequence;  ///< Echoed in the reply.
+    boost::endian::little_uint64_at client_send_us;  ///< Client's send time, echoed in the reply.
+  };
+
+  /**
+   * @brief Host's answer to clock_sync_request_t, sent to the session's own video endpoint.
+   *
+   * @details Host times are microseconds since the zero point of the RTP video timestamps, on
+   *          the clock they come from. The magic's first byte can't start an RTP version 2 packet
+   *          and the reply is shorter than any encrypted video packet, so a client tells it from
+   *          video without decrypting.
+   */
+  struct clock_sync_reply_t {
+    boost::endian::little_uint32_at magic;  ///< CLOCK_SYNC_REPLY_MAGIC.
+    boost::endian::little_uint32_at sequence;  ///< The request's sequence.
+    boost::endian::little_uint64_at client_send_us;  ///< The request's client send time.
+    boost::endian::little_uint64_at host_receive_us;  ///< When the request arrived.
+    boost::endian::little_uint64_at host_send_us;  ///< When this reply was sent.
+  };
+
+  static_assert(sizeof(clock_sync_request_t) == 32, "Clock sync request must be 32 bytes");
+  static_assert(sizeof(clock_sync_reply_t) == 32, "Clock sync reply must be 32 bytes");
+
 #pragma pack(pop)
+
+  constexpr std::uint32_t CLOCK_SYNC_REQUEST_MAGIC = 0x53434C4D;  ///< "MLCS" in memory.
+  constexpr std::uint32_t CLOCK_SYNC_REPLY_MAGIC = 0x4B434C4D;  ///< "MLCK" in memory.
+
+  // Answering faster than this would only let a client make the host send for it.
+  constexpr auto CLOCK_SYNC_MIN_INTERVAL = std::chrono::milliseconds(10);
 
   constexpr std::size_t round_to_pkcs7_padded(std::size_t size) {
     return ((size + 15) / 16) * 16;
@@ -628,6 +671,9 @@ namespace stream {
 
     asio::io_context io_context;
 
+    // Zero point of the RTP video timestamps, shared with clock sync replies.
+    std::chrono::steady_clock::time_point video_epoch;
+
     udp::socket video_sock {io_context};
     udp::socket audio_sock {io_context};
 
@@ -676,6 +722,22 @@ namespace stream {
 
       std::uint32_t lowseq;
       udp::endpoint peer;
+      // When a clock sync request was last answered. Receive thread only, under _sessions.
+      std::chrono::steady_clock::time_point last_clock_sync;
+
+      // A frame being sent in parts while NVENC encodes it (nvenc_subframe). See
+      // video_subframe.h. Video broadcast thread only.
+      struct {
+        int64_t frame_index = -1;  // Frame being sent, or -1 for none.
+        std::vector<uint8_t> pending;  // Bytes not sent yet, starting with the frame header until the first block goes out.
+        std::size_t blocks_sent = 0;  // FEC blocks of the frame sent so far.
+        uint32_t timestamp = 0;  // RTP timestamp of the frame.
+        bool dupe = false;  // Whether the frame repeats an earlier one.
+        bool announced = false;  // Whether sending in parts has been logged for this session.
+        std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  // The frame's send timestamp, from its first part.
+        std::chrono::steady_clock::time_point first_part_ready;  // When the frame's first part came out of the encoder.
+        std::chrono::steady_clock::duration last_remaining {};  // The last frame's time from its first part to its last.
+      } subframe;
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -695,6 +757,25 @@ namespace stream {
       pacing::adaptive_pacing_t adaptive_pacing;
       // Control thread only: validates and de-duplicates client FEC block reports.
       pacing::fec_report_tracker_t fec_reports;
+
+      // Experimental link rate adaptation (host_link_rate_adaptation, ordinary
+      // video only). The sender records each frame it sent; the control thread
+      // feeds pings and FEC reports, ticks the controller and applies the
+      // bitrate it returns. The mutex is held only for those short calls.
+      bool link_rate_enabled {false};
+      std::mutex link_rate_mutex;
+      link_rate::link_rate_t link_rate_controller;
+      // Set by /bitrate: the client owns the bitrate for the rest of the stream.
+      std::atomic<bool> client_bitrate_owned {false};
+      // The encoder reports whether it applies a bitrate without rebuilding.
+      safe::mail_raw_t::event_t<int> live_bitrate_events;
+      // The controller's bitrate steps, applied without forcing a keyframe.
+      safe::mail_raw_t::event_t<int> link_rate_bitrate_events;
+      // Control thread only.
+      link_rate::busy_meter_t link_rate_busy;
+      std::optional<bool> live_bitrate;
+      // The bitrate before the controller's first change, restored when it is done.
+      std::optional<int> link_rate_restore;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -774,7 +855,8 @@ namespace stream {
       std::atomic<std::uint16_t> last_encode_latency_us10 {0};  // in 1/10 ms units
       std::atomic<std::int64_t> last_frame_index {0};
       /// Index of the newest frame whose send began, or -1 before the first one.
-      /// Written only with host_adaptive_pacing, which fences client reports on it.
+      /// Written only with host_adaptive_pacing or host_link_rate_adaptation,
+      /// which fence client reports on it.
       std::atomic<std::int64_t> wire_frame_index {-1};
       /// Frames abandoned by a socket send failure; adaptive pacing treats a rise as loss.
       std::atomic<std::uint64_t> video_send_failures {0};
@@ -868,7 +950,7 @@ namespace stream {
       bitrate_override > 0 ? bitrate_override : config.monitor.bitrate,
       fps <= 4000 ? int(fps) : 4001,
       block - sizeof(video_packet_raw_t), block + prefix, sizeof(video_short_frame_header_t),
-      pyro ? std::max(config::stream.pyrowave_critical_fec_percentage, pyrowave::policy::MAX_DETAIL_FEC_PERCENTAGE) : config::stream.fec_percentage,
+      pyro ? std::max(config::stream.pyrowave_critical_fec_percentage, pyrowave::policy::MAX_DETAIL_FEC_PERCENTAGE) : config.fecPercentage,
       std::max(config.minRequiredFecPackets, pyro ? 2 : 0), pyro,
     });
   }
@@ -914,7 +996,7 @@ namespace stream {
       for (auto *session : *ctx.control_server._sessions) {
         if (session) {
           sessions.push_back({session->device_uuid, session->config.monitor.bitrate, session->config.monitor.client_requested_bitrate,
-                              session->video.pacing_bitrate_kbps, session->video.idr_events, session->video.bitrate_events});
+                              session->video.pacing_bitrate_kbps, session->video.idr_events, session->video.bitrate_events, &session->video.client_bitrate_owned});
         }
       }
       return action(sessions);
@@ -1709,20 +1791,173 @@ namespace stream {
     }
   }
 
+  /**
+   * @brief Log a link rate change. Called only when something changed, never per frame.
+   * @param change What the controller changed.
+   * @param left_full Whether the stream was at its requested bitrate before.
+   */
+  static void log_link_rate(const link_rate::change_t &change, bool left_full) {
+    const auto mbps = [](std::uint32_t kbps) {
+      return kbps / 1000.0;
+    };
+    const auto evidence = [&]() {
+      std::ostringstream out;
+      out << change.reason;
+      if (std::string_view {change.reason} == "unrecoverable_frames"sv) {
+        out << ": "sv << change.evidence.unrecoverable_frames << " frames in 2 s"sv;
+      } else if (std::string_view {change.reason} == "fec_loss_share"sv) {
+        out << ": "sv << unsigned(change.evidence.loss_windows) << " windows at 5% or more"sv;
+      } else if (std::string_view {change.reason} == "send_losses"sv) {
+        out << ": "sv << change.evidence.send_losses << " frames in 2 s"sv;
+      }
+      if (change.evidence.loss_share > 0) {
+        out << ", "sv << std::lround(change.evidence.loss_share * 100) << "% missing"sv;
+      }
+      if (change.delivered_kbps) {
+        out << ", delivered "sv << mbps(change.delivered_kbps) << " Mbps"sv;
+      }
+      return out.str();
+    };
+    switch (change.kind) {
+      case link_rate::change_kind_e::step_down:
+      case link_rate::change_kind_e::probe_failed:
+        if (left_full) {
+          BOOST_LOG(warning) << "Link rate: the network to this device cannot carry the stream; lowering the video bitrate from "sv
+                             << mbps(change.from_kbps) << " to "sv << mbps(change.to_kbps) << " Mbps ("sv << evidence() << ')';
+        } else {
+          BOOST_LOG(info) << "Link rate: "sv << link_rate::change_kind_name(change.kind) << " from "sv << mbps(change.from_kbps)
+                          << " to "sv << mbps(change.to_kbps) << " Mbps ("sv << evidence() << ')';
+        }
+        break;
+      case link_rate::change_kind_e::floor:
+        BOOST_LOG(warning) << "Link rate: still losing at the lowest bitrate, "sv << mbps(change.to_kbps) << " Mbps ("sv << evidence() << ')';
+        break;
+      case link_rate::change_kind_e::encoder_floor:
+        BOOST_LOG(info) << "Link rate: the encoder keeps sending "sv << mbps(change.delivered_kbps)
+                        << " Mbps of video wire traffic; cuts stop at "sv << mbps(change.to_kbps) << " Mbps"sv;
+        break;
+      case link_rate::change_kind_e::full:
+        BOOST_LOG(info) << "Link rate: the link carries the requested bitrate again, "sv << mbps(change.to_kbps) << " Mbps"sv;
+        break;
+      case link_rate::change_kind_e::probe:
+        BOOST_LOG(debug) << "Link rate: probing "sv << mbps(change.to_kbps) << " Mbps"sv;
+        break;
+    }
+  }
+
+  /**
+   * @brief Apply a bitrate chosen by the link rate controller to the encoder.
+   * @note Runs on the control thread under the sessions lock, which /bitrate
+   *       holds too, so the two never interleave.
+   */
+  static void apply_link_rate_bitrate(session_t *session, int kbps) {
+    session->config.monitor.bitrate = kbps;
+    session->video.pacing_bitrate_kbps.store(kbps, std::memory_order_relaxed);
+    session->video.link_rate_bitrate_events->raise(kbps);
+  }
+
+  /**
+   * @brief Tick the link rate controller from the control loop and apply its bitrate.
+   * @note Runs on the control thread, which also receives the pings and FEC reports.
+   */
+  static void tick_link_rate(session_t *session, std::chrono::steady_clock::time_point now) {
+    auto &video = session->video;
+    if (!video.link_rate_enabled || !session->control.peer) {
+      return;
+    }
+    while (video.live_bitrate_events->peek()) {
+      if (auto live = video.live_bitrate_events->pop(0ms)) {
+        video.live_bitrate = video.live_bitrate.value_or(true) && *live != 0;
+      }
+    }
+    if (video.client_bitrate_owned.load(std::memory_order_relaxed)) {
+      // The client's bitrate stands; nothing is restored over it.
+      video.link_rate_restore.reset();
+      std::lock_guard lg {video.link_rate_mutex};
+      if (video.link_rate_controller.state() != link_rate::state_e::off) {
+        video.link_rate_controller.client_takeover();
+        BOOST_LOG(info) << "Link rate: the client sets the bitrate itself; host adaptation is off for this stream"sv;
+      }
+      return;
+    }
+    if (!video.live_bitrate) {
+      // The encoder has not started yet.
+      return;
+    }
+    if (!*video.live_bitrate) {
+      bool stopped = false;
+      {
+        std::lock_guard lg {video.link_rate_mutex};
+        if (video.link_rate_controller.state() != link_rate::state_e::off) {
+          video.link_rate_controller.encoder_rebuilds();
+          stopped = true;
+        }
+      }
+      if (stopped) {
+        BOOST_LOG(info) << "Link rate: this encoder rebuilds to change the bitrate; host adaptation is off for this stream"sv;
+        if (const auto restore = std::exchange(video.link_rate_restore, std::nullopt)) {
+          apply_link_rate_bitrate(session, *restore);
+        }
+      }
+      return;
+    }
+
+    const auto framerate = std::max(session->config.monitor.framerate, 1);
+    const auto current = video.pacing_bitrate_kbps.load(std::memory_order_relaxed);
+    const bool busy = video.link_rate_busy.update(
+      now,
+      session->stats.frames_sent.load(std::memory_order_relaxed),
+      session->stats.bytes_sent.load(std::memory_order_relaxed),
+      framerate,
+      std::uint32_t(std::max(current, 0))
+    );
+    const auto rtt = std::chrono::milliseconds {session->control.peer->roundTripTime};
+
+    std::optional<std::uint32_t> target;
+    std::optional<link_rate::change_t> change;
+    bool left_full = false;
+    {
+      std::lock_guard lg {video.link_rate_mutex};
+      left_full = video.link_rate_controller.state() == link_rate::state_e::full;
+      target = video.link_rate_controller.tick(now, rtt, session->config.fecPercentage, framerate, std::uint32_t(std::max(current, 0)), busy);
+      change = video.link_rate_controller.take_change();
+    }
+    int applied = current;
+    if (target) {
+      if (!video.link_rate_restore) {
+        video.link_rate_restore = current;
+      }
+      applied = int(*target);
+    } else if (video.link_rate_restore) {
+      applied = *std::exchange(video.link_rate_restore, std::nullopt);
+    }
+    if (applied != current) {
+      apply_link_rate_bitrate(session, applied);
+    }
+    if (change) {
+      log_link_rate(*change, left_full);
+    }
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+      const auto now = std::chrono::steady_clock::now();
       if (session->video.adaptive_pacing_enabled) {
         // Standard pings show the client is alive and sending control traffic.
         std::lock_guard lg {session->video.adaptive_pacing_mutex};
-        session->video.adaptive_pacing.on_ping(std::chrono::steady_clock::now(), payload);
+        session->video.adaptive_pacing.on_ping(now, payload);
+      }
+      if (session->video.link_rate_enabled) {
+        std::lock_guard lg {session->video.link_rate_mutex};
+        session->video.link_rate_controller.on_ping(now, payload);
       }
     });
 
     // Client to host SS_FRAME_FEC_STATUS: one report per FEC block that needed
     // recovery or was dropped. (Host to client, the same number is Set RGB LED.)
     server->map(pacing::fec_status_packet_type, [](session_t *session, const std::string_view &payload) {
-      if (!session->video.adaptive_pacing_enabled) {
+      if (!session->video.adaptive_pacing_enabled && !session->video.link_rate_enabled) {
         // Off: behave as before this type had a handler.
         BOOST_LOG(debug)
           << "type [Unknown] { "sv << util::hex(pacing::fec_status_packet_type).to_string_view() << " }"sv << std::endl
@@ -1736,11 +1971,21 @@ namespace stream {
       if (!report) {
         return;
       }
-      // record() accepted it, so `last_sent` is set.
-      const auto framerate = std::max(session->config.monitor.framerate, 1);
-      const auto period = std::chrono::nanoseconds {1'000'000'000 / framerate};
-      std::lock_guard lg {session->video.adaptive_pacing_mutex};
-      session->video.adaptive_pacing.on_block(report->frame, *last_sent, period, report->block);
+      if (session->video.adaptive_pacing_enabled) {
+        // record() accepted it, so `last_sent` is set.
+        const auto framerate = std::max(session->config.monitor.framerate, 1);
+        const auto period = std::chrono::nanoseconds {1'000'000'000 / framerate};
+        std::lock_guard lg {session->video.adaptive_pacing_mutex};
+        session->video.adaptive_pacing.on_block(report->frame, *last_sent, period, report->block);
+      }
+      if (session->video.link_rate_enabled) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lg {session->video.link_rate_mutex};
+        session->video.link_rate_controller.on_status(report->status, now);
+        if (report->block.kind == pacing::fec_block_t::kind_e::unrecoverable) {
+          session->video.link_rate_controller.on_unrecoverable(report->frame, now);
+        }
+      }
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -2209,6 +2454,7 @@ namespace stream {
 
             // The sample period (500 ms) is longer than this loop's ENet wait.
             tick_adaptive_pacing(session, now);
+            tick_link_rate(session, now);
           }
 
           ++pos;
@@ -2301,8 +2547,56 @@ namespace stream {
       }
     };
 
+    auto to_epoch_us = [&](std::chrono::steady_clock::time_point time) {
+      return (std::uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(time - ctx.video_epoch).count();
+    };
+
+    // Answers a clock sync request from a running session, to its own video endpoint only, so
+    // a forged source address can't aim replies anywhere else. A reply is no larger than the
+    // request it answers, and a session gets at most one every CLOCK_SYNC_MIN_INTERVAL.
+    auto answer_clock_sync = [&](const clock_sync_request_t &request, const udp::endpoint &peer, std::chrono::steady_clock::time_point received) {
+      const std::string session_id {request.payload, sizeof(request.payload)};
+
+      auto lg = ctx.control_server._sessions.lock();
+      for (auto *session : *ctx.control_server._sessions) {
+        if (session->video.ping_payload != session_id) {
+          continue;
+        }
+
+        if (session->video.peer.port() == 0 || session->video.peer.address() != peer.address() ||
+            received - session->video.last_clock_sync < CLOCK_SYNC_MIN_INTERVAL) {
+          return;
+        }
+        session->video.last_clock_sync = received;
+
+        clock_sync_reply_t reply {};
+        reply.magic = CLOCK_SYNC_REPLY_MAGIC;
+        reply.sequence = request.sequence;
+        reply.client_send_us = request.client_send_us;
+        reply.host_receive_us = to_epoch_us(received);
+
+        auto peer_address = session->video.peer.address();
+        auto send_info = platf::send_info_t {
+          nullptr,
+          0,
+          (const char *) &reply,
+          sizeof(reply),
+          (uintptr_t) video_sock.native_handle(),
+          peer_address,
+          session->video.peer.port(),
+          session->localAddress,
+        };
+
+        // Stamped as late as possible, so the time spent here counts as the host's.
+        reply.host_send_us = to_epoch_us(std::chrono::steady_clock::now());
+        platf::send(send_info);
+        return;
+      }
+    };
+
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+        const auto received = std::chrono::steady_clock::now();
         // Snapshot this sender before rearming the socket's receive.
         const auto peer = peers[buf_elem];
         auto fg = util::fail_guard([&]() {
@@ -2325,6 +2619,16 @@ namespace stream {
         }
 
         (buf_elem ? ctx.audio_recv_count : ctx.video_recv_count).fetch_add(1, std::memory_order_relaxed);
+
+        // Clock sync requests (sent only by clients that support them) are answered here
+        // and are not treated as pings.
+        if (buf_elem == 0 && bytes == sizeof(clock_sync_request_t)) {
+          const auto request = (const clock_sync_request_t *) buf[buf_elem].data();
+          if (request->magic == CLOCK_SYNC_REQUEST_MAGIC) {
+            answer_clock_sync(*request, peer, received);
+            return;
+          }
+        }
 
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
@@ -2355,10 +2659,9 @@ namespace stream {
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, std::chrono::steady_clock::time_point video_epoch) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
     // relies on this thread waking on its millisecond sleep deadlines; losing the
@@ -2440,6 +2743,18 @@ namespace stream {
       if (!session) {
         continue;
       }
+
+      // A part of a frame sent while it is encoded (nvenc_subframe). See video_subframe.h.
+      const bool subframe_part = packet->subframe_part >= 0;
+      auto &subframe = session->video.subframe;
+      if (!subframe_part) {
+        // A frame that was being sent in parts will not be finished now
+        subframe.frame_index = -1;
+      } else if (packet->subframe_part > 0 && subframe.frame_index != packet->frame_index()) {
+        // The start of this frame never went out
+        continue;
+      }
+
       const auto packet_pop_timestamp = std::chrono::steady_clock::now();
       auto wire_state_it = wire_timeline_by_session.find(session);
       if (wire_state_it == wire_timeline_by_session.end()) {
@@ -2490,7 +2805,9 @@ namespace stream {
       frame_header.frameType = packet->is_idr()                     ? 2 :
                                packet->after_ref_frame_invalidation ? 5 :
                                                                       1;
-      frame_header.lastPayloadLen = (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
+      // A frame sent in parts does not know its size when its header goes out. H.264 and
+      // HEVC decoders skip the zero padding after the frame, and only those are sent in parts.
+      frame_header.lastPayloadLen = subframe_part ? 0 : (payload.size() + sizeof(frame_header)) % (session->config.packetsize - sizeof(NV_VIDEO_PACKET));
       if (frame_header.lastPayloadLen == 0) {
         frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
       }
@@ -2502,10 +2819,24 @@ namespace stream {
           return (uint16_t) std::clamp<decltype(duration_us)>((duration_us + 50) / 100, 0, std::numeric_limits<uint16_t>::max());
         };
 
-        uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *host_processing_timestamp);
-        frame_header.frame_processing_latency = latency;
-        frame_processing_latency_logger.collect_and_log(latency / 10.);
-        session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+        if (subframe_part) {
+          // The header goes out with the first part, while the rest of the frame is still
+          // encoding, so the previous frame's remaining encode time stands in for it. Parts
+          // are timed from when the encoder handed them over, not from when they were sent.
+          if (packet->subframe_part == 0) {
+            uint16_t latency = duration_to_latency(video::subframe::estimated_latency(packet->subframe_ready - *host_processing_timestamp, subframe.last_remaining));
+            frame_header.frame_processing_latency = latency;
+            session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+          }
+          if (packet->subframe_final) {
+            frame_processing_latency_logger.collect_and_log(std::chrono::duration<double, std::milli>(packet->subframe_ready - *host_processing_timestamp).count());
+          }
+        } else {
+          uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *host_processing_timestamp);
+          frame_header.frame_processing_latency = latency;
+          frame_processing_latency_logger.collect_and_log(latency / 10.);
+          session->stats.last_encode_latency_us10.store(latency, std::memory_order_relaxed);
+        }
       } else {
         frame_header.frame_processing_latency = 0;
         session->stats.last_encode_latency_us10.store(0, std::memory_order_relaxed);
@@ -2516,8 +2847,8 @@ namespace stream {
       // Critical shards receive baseline parity. Stable pictures at low cadence
       // may also protect detail, bounded by unused bitrate and FEC block capacity.
       const bool pyrowave_session = session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT;
-      auto fecPercentage = pyrowave_session ? 0 : config::stream.fec_percentage;
-      if (session->video.adaptive_pacing_enabled) {
+      auto fecPercentage = pyrowave_session ? 0 : session->config.fecPercentage;
+      if (session->video.adaptive_pacing_enabled || session->video.link_rate_enabled) {
         session->stats.wire_frame_index.store(packet->frame_index(), std::memory_order_relaxed);
       }
 
@@ -2532,9 +2863,11 @@ namespace stream {
                                             0;
       frame_header.pyrowave_critical_packets = std::uint16_t(std::min<std::size_t>(critical_shards, std::numeric_limits<std::uint16_t>::max()));
 
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
-
-      payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      std::vector<uint8_t> payload_new;
+      if (!subframe_part) {
+        payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+        payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      }
 
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = pyrowave::protocol::MAX_FEC_BLOCKS;
@@ -2542,6 +2875,13 @@ namespace stream {
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
       std::array<int, MAX_FEC_BLOCKS> fec_block_percentages {};
       std::size_t fec_blocks_needed = 0;
+      // The blocks this packet sends: all of the frame's, or for a frame sent in parts, the
+      // ones this part completes, at their place in the frame.
+      std::size_t first_block = 0;
+      std::size_t last_block = 0;
+      std::size_t subframe_part_shards = 0;
+      static_assert(video::subframe::blocks <= MAX_FEC_BLOCKS);
+      std::array<std::vector<uint8_t>, MAX_FEC_BLOCKS> subframe_block_buffers;
       // The client asks for at least 2 parity shards; PyroWave's critical block always has them.
       const std::size_t min_parity_shards = pyrowave_session ?
                                               std::max<std::size_t>(2, std::size_t(std::max(session->config.minRequiredFecPackets, 0))) :
@@ -2582,6 +2922,69 @@ namespace stream {
           offset += block.data_shards * blocksize;
           ++fec_blocks_needed;
         }
+      } else if (subframe_part) {
+        if (packet->subframe_part == 0) {
+          subframe.frame_index = packet->frame_index();
+          subframe.blocks_sent = 0;
+          subframe.first_part_ready = packet->subframe_ready;
+          subframe.pending.assign((uint8_t *) &frame_header, (uint8_t *) &frame_header + sizeof(frame_header));
+        }
+        subframe.pending.insert(std::end(subframe.pending), packet->data(), packet->data() + packet->data_size());
+
+        const std::size_t max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+        std::vector<std::size_t> block_sizes;
+        if (!packet->subframe_final) {
+          // Every packet names the frame's last block, so a frame that starts going out
+          // early always has all of them. The last one is kept for when the frame finishes.
+          fec_blocks_needed = video::subframe::blocks;
+          if (subframe.blocks_sent + 1 < video::subframe::blocks) {
+            const auto bytes = video::subframe::early_block_bytes(subframe.pending.size(), payload_blocksize, max_data_shards_per_fec_block);
+            if (bytes) {
+              block_sizes = {bytes};
+            }
+          }
+        } else {
+          if (subframe.blocks_sent == 0) {
+            // Nothing went out early, so the frame takes as many blocks as it needs like any other
+            const auto max_data_per_fec_block = max_data_shards_per_fec_block * payload_blocksize;
+            fec_blocks_needed = std::clamp<std::size_t>((subframe.pending.size() + max_data_per_fec_block - 1) / max_data_per_fec_block, 1, video::subframe::blocks);
+          } else {
+            fec_blocks_needed = video::subframe::blocks;
+          }
+          block_sizes = video::subframe::final_block_bytes(subframe.pending.size(), payload_blocksize, fec_blocks_needed - subframe.blocks_sent);
+        }
+
+        if (block_sizes.empty()) {
+          // Not a whole packet yet; it goes with the next part
+          continue;
+        }
+        if (!subframe.announced) {
+          subframe.announced = true;
+          BOOST_LOG(info) << "Sending video frames in parts while they encode"sv;
+        }
+
+        first_block = subframe.blocks_sent;
+        std::size_t offset = 0;
+        for (std::size_t x = 0; x < block_sizes.size(); ++x) {
+          // A block with nothing left to carry is one packet of zeros after the end of the frame
+          static const char zero_padding = 0;
+          const auto bytes = block_sizes[x];
+          const std::string_view data = bytes ? std::string_view {(char *) subframe.pending.data() + offset, bytes} : std::string_view {&zero_padding, 1};
+          subframe_block_buffers[x] = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, data, std::string_view {});
+
+          // FEC is left out of a block too large for it, as it is for a frame too large for it
+          const auto block_packets = (data.size() + payload_blocksize - 1) / payload_blocksize;
+          fec_blocks[first_block + x] = std::string_view {(char *) subframe_block_buffers[x].data(), subframe_block_buffers[x].size()};
+          fec_block_percentages[first_block + x] = block_packets > max_data_shards_per_fec_block ? 0 : fecPercentage;
+          if (block_packets > video::subframe::max_block_packets) {
+            BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << block_packets << " packets in one block)"sv;
+          }
+          subframe_part_shards += block_packets;
+          offset += bytes;
+        }
+        last_block = first_block + block_sizes.size();
+        subframe.blocks_sent = last_block;
+        subframe.pending.erase(std::begin(subframe.pending), std::begin(subframe.pending) + offset);
       } else {
         // The max number of data shards per block is found by solving this system of equations for D:
         // D = 255 - P
@@ -2628,16 +3031,19 @@ namespace stream {
       }
 
       decltype(fec_blocks)::iterator
-        fec_blocks_begin = std::begin(fec_blocks),
-        fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
+        fec_blocks_begin = std::begin(fec_blocks) + first_block,
+        fec_blocks_end = std::begin(fec_blocks) + (subframe_part ? last_block : fec_blocks_needed);
+      if (!subframe_part) {
+        last_block = fec_blocks_needed;
+      }
 
       // Both ordinary demand modes use this frame's actual FEC packet count.
       // The existing batch-only option preserves its deadline behavior; group
       // pacing is a separate opt-in so saved configurations remain compatible.
-      std::size_t pacing_frame_packets = total_shards;
+      std::size_t pacing_frame_packets = subframe_part ? subframe_part_shards : total_shards;
       if (!pyrowave_session && (config::stream.pacing_batch_demand_limit || config::stream.pacing_group_demand_limit)) {
         pacing_frame_packets = 0;
-        for (std::size_t x = 0; x < fec_blocks_needed; ++x) {
+        for (std::size_t x = first_block; x < last_block; ++x) {
           const auto data_shards = (fec_blocks[x].size() + blocksize - 1) / blocksize;
           pacing_frame_packets += pacing::fec_expanded_packets(data_shards, fec_block_percentages[x], min_parity_shards);
         }
@@ -2647,11 +3053,30 @@ namespace stream {
 
       std::size_t frame_packets_accepted = 0;
       const auto bytes_per_packet = blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+      if (session->video.link_rate_enabled) {
+        // Recorded before the first packet leaves: on a short path the report
+        // for a frame's first FEC block can arrive before its last block is sent.
+        std::size_t frame_packets = 0;
+        for (std::size_t x = 0; x < fec_blocks_needed; ++x) {
+          const auto data_shards = (fec_blocks[x].size() + blocksize - 1) / blocksize;
+          frame_packets += pacing::fec_expanded_packets(data_shards, fec_block_percentages[x], min_parity_shards);
+        }
+        // Link bytes per packet: Ethernet framing, IP and UDP headers.
+        const auto link_bytes = bytes_per_packet + 38 + (session->video.peer.address().is_v6() ? 40 : 20) + 8;
+        std::lock_guard lg {session->video.link_rate_mutex};
+        session->video.link_rate_controller.on_sent(static_cast<std::uint32_t>(packet->frame_index()), std::uint32_t(frame_packets), std::uint64_t(frame_packets) * link_bytes, std::chrono::steady_clock::now());
+      }
+      // A socket send failure abandoned this frame part way.
+      bool frame_send_lost = false;
       auto account_accepted_packets = util::fail_guard([&] {
         // These counters feed session-history bitrate. Preserve actual socket
         // traffic even when only a prefix of the frame was accepted.
         session->stats.packets_sent.fetch_add(frame_packets_accepted, std::memory_order_relaxed);
         session->stats.bytes_sent.fetch_add(frame_packets_accepted * bytes_per_packet, std::memory_order_relaxed);
+        if (session->video.link_rate_enabled && frame_send_lost) {
+          std::lock_guard lg {session->video.link_rate_mutex};
+          session->video.link_rate_controller.on_send_loss(static_cast<std::uint32_t>(packet->frame_index()), std::chrono::steady_clock::now());
+        }
       });
 
       try {
@@ -2661,8 +3086,9 @@ namespace stream {
         const auto pacing_ceiling = config::stream.pacing_max_bitrate_kbps;
         const auto capped_batch_packets = video_pacing_batch_packets(
           pacing_ceiling, blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0));
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
-        ratecontrol_packets_in_1ms = std::max<size_t>(1, ratecontrol_packets_in_1ms);
+        // The session's send rate: the client's x-ml-video.sendRateMbps request, or
+        // 800 Mbps (80% of gigabit) as before.
+        size_t ratecontrol_packets_in_1ms = video_send_rate_packets_per_ms(session->config.sendRateMbps, blocksize);
         std::size_t ordinary_batch_quantum_packets = 1;
         if (pacing_ceiling > 0 && capped_batch_packets == 0) {
           BOOST_LOG(error) << "Configured pacing ceiling has an invalid video datagram"sv;
@@ -2764,9 +3190,9 @@ namespace stream {
             sizeof(frame_header),
             payload_blocksize,
             wire_bytes,
-            // The configured value: oversized frames zero fecPercentage for
+            // The session's value: oversized frames zero fecPercentage for
             // themselves only and must not move the controller's wire floor.
-            config::stream.fec_percentage,
+            session->config.fecPercentage,
             min_parity_shards
           );
           pacing::adaptive_pacing_events_t events;
@@ -2862,20 +3288,33 @@ namespace stream {
         // both lets a client trace distinguish a source gap from a frame held
         // after capture.
         bool frame_is_dupe = false;
-        if (!packet->frame_timestamp) {
-          packet->frame_timestamp = ratecontrol_next_frame_start;
-          frame_is_dupe = true;
-        }
+        uint32_t timestamp = 0;
+        if (subframe_part && packet->subframe_part > 0) {
+          // Every part of a frame carries the timestamp its first part went out with
+          frame_is_dupe = subframe.dupe;
+          packet->frame_timestamp = subframe.frame_timestamp;
+          timestamp = subframe.timestamp;
+        } else {
+          if (!packet->frame_timestamp) {
+            packet->frame_timestamp = ratecontrol_next_frame_start;
+            frame_is_dupe = true;
+          }
 #ifdef _WIN32
-        else {
-          // WGC composition times sit on the virtual display's refresh grid.
-          // Place the frame by the game's present cadence now that ETW has
-          // had the encode time to deliver those presents.
-          packet->frame_timestamp = platf::dxgi::present_timing::refine_send_timestamp(*packet->frame_timestamp);
-        }
+          else {
+            // WGC composition times sit on the virtual display's refresh grid.
+            // Place the frame by the game's present cadence now that ETW has
+            // had the encode time to deliver those presents.
+            packet->frame_timestamp = platf::dxgi::present_timing::refine_send_timestamp(*packet->frame_timestamp);
+          }
 #endif
-        using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
-        const uint32_t timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          using rtp_tick = std::chrono::duration<uint32_t, std::ratio<1, 90000>>;
+          timestamp = std::chrono::round<rtp_tick>(*packet->frame_timestamp - video_epoch).count();
+          if (subframe_part) {
+            subframe.dupe = frame_is_dupe;
+            subframe.frame_timestamp = packet->frame_timestamp;
+            subframe.timestamp = timestamp;
+          }
+        }
 
         // PyroWave record framing: flag the shards that start with a record, where a
         // client that lost a record header resumes parsing.
@@ -2892,7 +3331,7 @@ namespace stream {
         double burst_max_send_ms = 0.0;
         std::size_t burst_fallback_batches = 0;
 
-        auto blockIndex = 0;
+        auto blockIndex = (int) first_block;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
@@ -3115,6 +3554,17 @@ namespace stream {
           }
         }
 
+        if (subframe_part) {
+          if (!packet->subframe_final) {
+            // The frame is counted once its last part is sent
+            continue;
+          }
+          // How long the rest of the frame took, for the next frame's latency estimate
+          subframe.last_remaining = packet->subframe_ready - subframe.first_part_ready;
+          subframe.frame_index = -1;
+          subframe.pending.clear();
+        }
+
         const auto send_complete_timestamp = std::chrono::steady_clock::now();
 #ifdef __linux__
         {
@@ -3245,8 +3695,11 @@ namespace stream {
         // A failed frame is not a successful delivery. Keep the next frame's
         // sequence reservation, omit frame-success counters and avoid the generic
         // exception path's 100 ms sleep for temporary socket pressure.
+        // The rest of a frame being sent in parts is dropped.
+        subframe.frame_index = -1;
         if (!e.cancelled) {
           session->stats.video_send_failures.fetch_add(1, std::memory_order_relaxed);
+          frame_send_lost = true;
           ++failed_video_frames;
           const auto now = std::chrono::steady_clock::now();
           if (now >= next_send_failure_log) {
@@ -3260,6 +3713,7 @@ namespace stream {
         }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
+        subframe.frame_index = -1;
         std::this_thread::sleep_for(100ms);
       }
     }
@@ -3472,7 +3926,8 @@ namespace stream {
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_epoch = std::chrono::steady_clock::now();
+    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock), ctx.video_epoch};
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
@@ -4226,6 +4681,27 @@ namespace stream {
       // PyroWave keeps its own pacing; the controller only serves ordinary video.
       session.video.adaptive_pacing_enabled = config::stream.host_adaptive_pacing && !pyrowave_session;
       session.video.adaptive_pacing = pacing::adaptive_pacing_t {session.video.adaptive_pacing_enabled};
+      // Link rate adaptation changes the encoder bitrate; PyroWave sizes its
+      // own frames to the link.
+      session.video.link_rate_enabled = config::stream.host_link_rate_adaptation && !pyrowave_session;
+      if (session.video.link_rate_enabled) {
+        const std::size_t blocksize = std::size_t(std::max(session.config.packetsize, 0)) + MAX_RTP_HEADER_SIZE;
+        boost::system::error_code address_error;
+        const auto peer_address = boost::asio::ip::make_address(addr_string, address_error);
+        // Ethernet framing, IP and UDP headers, as the sender counts them.
+        const std::size_t ip_header_bytes = !address_error && !peer_address.is_v6() ? 20 : 40;
+        const link_rate::wire_budget_t budget {
+          sizeof(video_short_frame_header_t),
+          blocksize - sizeof(video_packet_raw_t),
+          blocksize + (session.video.cipher ? sizeof(video_packet_enc_prefix_t) : 0) + 38 + ip_header_bytes + 8,
+          std::size_t(std::max(session.config.minRequiredFecPackets, 0)),
+          link_rate::wire_budget_t::audio_reserve_bps(session.audio_disabled ? 0 : session.config.audio.channels, session.config.audio.flags[audio::config_t::HIGH_QUALITY]),
+        };
+        session.video.link_rate_controller = link_rate::link_rate_t {true, false, std::uint32_t(std::max(pacing_bitrate_kbps, 0)), budget};
+        BOOST_LOG(info) << "Link rate: host adaptation is on, requested "sv << pacing_bitrate_kbps << " kbps"sv;
+      } else if (config::stream.host_link_rate_adaptation) {
+        BOOST_LOG(info) << "Link rate: host adaptation is off for PyroWave"sv;
+      }
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
@@ -4581,6 +5057,8 @@ namespace stream {
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.bitrate_events = mail->event<int>(mail::dynamic_bitrate);
+      session->video.live_bitrate_events = mail->event<int>(mail::live_bitrate);
+      session->video.link_rate_bitrate_events = mail->event<int>(mail::link_rate_bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

@@ -97,6 +97,10 @@ namespace video {
     // is PyroWave, which pins and reads each capture image's own texture and
     // keyed mutex, so the capture must give every image a stable copy.
     bool shared_capture_pyrowave = false;
+    // Optional exact client rate in microhertz (x-ml-video.clientRefreshRateUhz),
+    // e.g. 71.8317 Hz as 71831700. Finer than framerateX100 and preferred over it.
+    // 0 when the client didn't send one.
+    int framerateUhz = 0;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);
@@ -310,6 +314,24 @@ namespace video {
     }
 
     /**
+     * @brief Apply a host link rate step: in place, and without forcing a keyframe on a raise.
+     * @param bitrate_kbps New bitrate in kbps.
+     * @return `true` if the encoder reconfigured itself in place; `false` if the caller must
+     *         rebuild the encode session to apply the change.
+     */
+    virtual bool step_bitrate(int bitrate_kbps) {
+      return set_bitrate(bitrate_kbps);
+    }
+
+    /**
+     * @brief Whether set_bitrate() reconfigures this encoder in place.
+     * @return `true` for encoders that change bitrate without a rebuild (and the keyframe it costs).
+     */
+    virtual bool applies_bitrate_live() const {
+      return false;
+    }
+
+    /**
      * @brief Replace static HDR mastering metadata used for subsequent encoded frames.
      * @param metadata New mastering-display and content-light metadata.
      */
@@ -380,6 +402,13 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp;
     std::chrono::steady_clock::time_point packet_enqueue_timestamp = std::chrono::steady_clock::now();
+    /// Which part of a frame sent while it is encoded this is, from 0, or -1 for a whole
+    /// frame (nvenc_subframe). See video_subframe.h.
+    int subframe_part = -1;
+    /// Whether this is the last part of a frame sent in parts.
+    bool subframe_final = false;
+    /// When the encoder handed over this part of a frame sent in parts.
+    std::chrono::steady_clock::time_point subframe_ready {};
   };
 
   struct packet_raw_avcodec: packet_raw_t {
@@ -538,5 +567,28 @@ namespace video {
   inline AVRational framerateX100_to_rational(const int framerateX100) {
     const auto rational = policy::framerate_x100_to_rational(framerateX100);
     return AVRational {rational.numerator, rational.denominator};
+  }
+
+  /**
+   * @brief Whether the client asked for an exact (fractional) rate.
+   */
+  template<class Config>
+  inline bool has_exact_framerate(const Config &config) {
+    return config.framerateUhz > 0 || config.framerateX100 > 0;
+  }
+
+  /**
+   * @brief The client's exact rate: microhertz if sent, then X100, else the integer rate.
+   */
+  template<class Config>
+  inline AVRational exact_framerate_to_rational(const Config &config) {
+    if (config.framerateUhz > 0) {
+      const auto rational = policy::framerate_uhz_to_rational(config.framerateUhz);
+      return AVRational {rational.numerator, rational.denominator};
+    }
+    if (config.framerateX100 > 0) {
+      return framerateX100_to_rational(config.framerateX100);
+    }
+    return AVRational {config.framerate, 1};
   }
 }  // namespace video

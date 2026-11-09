@@ -141,6 +141,31 @@ INSTANTIATE_TEST_SUITE_P(
   )
 );
 
+TEST(FramerateUhz, ReducesToLowestTerms) {
+  EXPECT_EQ(video::policy::framerate_uhz_to_rational(71831700), (video::policy::rational_t {718317, 10000}));
+  EXPECT_EQ(video::policy::framerate_uhz_to_rational(60000000), (video::policy::rational_t {60, 1}));
+  EXPECT_EQ(video::policy::framerate_uhz_to_rational(143655000), (video::policy::rational_t {28731, 200}));
+}
+
+TEST(FramerateUhz, ExactRateMustBeWithinOneFrameOfMaxFps) {
+  // X100
+  EXPECT_TRUE(video::policy::exact_framerate_matches(5994, 100, 60));
+  EXPECT_TRUE(video::policy::exact_framerate_matches(5949, 100, 60));  // rounds to 59, still within 1 fps
+  EXPECT_TRUE(video::policy::exact_framerate_matches(12049, 100, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(5900, 100, 60));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(6000, 100, 120));  // stale 60 Hz with maxFPS 120
+  EXPECT_FALSE(video::policy::exact_framerate_matches(0, 100, 60));
+  // Microhertz
+  EXPECT_TRUE(video::policy::exact_framerate_matches(71831700, 1'000'000, 72));
+  EXPECT_TRUE(video::policy::exact_framerate_matches(119880120, 1'000'000, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(60000000, 1'000'000, 120));
+  // A 120 Hz panel that really runs at 118.97 Hz (Odin 2 Portal)
+  EXPECT_TRUE(video::policy::exact_framerate_matches(118970732, 1'000'000, 120));
+  EXPECT_TRUE(video::policy::exact_framerate_matches(11897, 100, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(118000000, 1'000'000, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(144000000, 1'000'000, 120));
+}
+
 TEST(VideoOutputPolicy, KeepsConfiguredVirtualOutputWhenAnotherVirtualDisplayEnumeratesFirst) {
   const std::array<std::string, 2> active_outputs {
     "\\\\.\\DISPLAY54",

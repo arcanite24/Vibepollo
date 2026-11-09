@@ -62,6 +62,9 @@ namespace nvenc {
     // Allocate more bitrate to flat regions since they're visually more perceptible, uses CUDA cores
     bool adaptive_quantization = false;
 
+    // Spatial AQ strength from 1 (subtle) to 15 (aggressive); 0 lets the driver decide. Only applies when adaptive_quantization is enabled
+    int aq_strength = 0;
+
     // Allocate more bitrate to frames with more motion, reduces block-artefact pulsing in moving scenes
     bool temporal_aq = false;
 
@@ -88,6 +91,9 @@ namespace nvenc {
 
     // Intra refresh for clients that doesn't request keyframe correctly
     bool intra_refresh = false;
+
+    // Send H.264/HEVC frames in parts as their slices finish encoding (sub-frame readback)
+    bool subframe_readback = false;
   };
 
 }  // namespace nvenc

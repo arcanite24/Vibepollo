@@ -61,6 +61,47 @@ namespace stream {
   video_pacing_reservation_t video_pacing_reservation(int ceiling_kbps, const video_pacing_demand_t &demand);
   bool reserve_video_pacing_capacity(std::uint64_t &used_ns_per_second, const video_pacing_reservation_t &reservation);
 
+  /**
+   * @brief Choose the FEC percentage for a session.
+   *
+   * @param requested Percentage the client asked for (x-ml-video.fecPercent), or a negative value if it didn't ask.
+   * @param host_default The host's fec_percentage.
+   * @return The client's request when it is from 0 to 255, otherwise the host's.
+   */
+  inline int session_fec_percentage(int requested, int host_default) {
+    // The client may turn FEC off (0) for itself; the host's own setting starts at 1.
+    return requested >= 0 && requested <= 255 ? requested : host_default;
+  }
+
+  /// Fixed video send rate used when a client doesn't ask for one: 80% of gigabit.
+  constexpr int DEFAULT_VIDEO_SEND_RATE_MBPS = 800;
+
+  /**
+   * @brief Choose the video send (burst) rate for a session.
+   *
+   * @param requested Rate in Mbps the client asked for (x-ml-video.sendRateMbps), or 0 if it didn't ask.
+   * @param host_default The host's rate, DEFAULT_VIDEO_SEND_RATE_MBPS.
+   * @return The client's request when it is from 100 to 100000 Mbps, otherwise the host's.
+   */
+  inline int session_video_send_rate(int requested, int host_default) {
+    return requested >= 100 && requested <= 100000 ? requested : host_default;
+  }
+
+  /**
+   * @brief Packets per millisecond at a video send rate.
+   *
+   * @param send_rate_mbps Rate each frame's packets are sent at.
+   * @param block_size Bytes per video packet, as the fixed pacer has always counted them.
+   * @return At least one packet per millisecond.
+   */
+  inline std::size_t video_send_rate_packets_per_ms(int send_rate_mbps, std::size_t block_size) {
+    if (block_size == 0) {
+      return 1;
+    }
+    //                               Mbps -> bytes per ms                                        packet
+    return std::max<std::size_t>(1, std::size_t(std::max(send_rate_mbps, 1)) * 1'000'000 / 8 / 1000 / block_size);
+  }
+
   inline std::string canonical_codec_name(std::string_view codec) {
     if (codec.empty()) {
       return {};

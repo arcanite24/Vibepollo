@@ -2856,6 +2856,46 @@ PyroWave is unchanged. Example: `pacing_group_demand_limit = true`.
     </tr>
 </table>
 
+### host_link_rate_adaptation
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Experimental opt-in for ordinary H.264, HEVC and AV1 streams on encoders that change bitrate in place
+            (NVENC and native AMF). When the network cannot carry the stream, Vibepollo lowers the encoder bitrate
+            toward the rate the link delivered, then probes back up in small steps and returns to the requested
+            bitrate after 10 clean seconds at it. A healthy link changes nothing.
+            <br><br>
+            A cut needs one of: three unrecoverable frames within two seconds; at least 5% of the packets sent
+            reported missing in two consecutive half-second windows of at least 100 packets (in blocks FEC rebuilt,
+            missing data packets count only while the control round trip time is raised, and only above what the
+            path reorders while it is flat); three frames the host could not send whole; or a round trip time
+            15 ms above its 30-second low for two seconds that starts right after a probe. A cut aims at 85% of the
+            delivered rate and lowers the bitrate by 15% to 50%; reports for frames sent before a change are ignored
+            until the bottleneck has had time to drain. Probes step by an eighth (a twentieth near a rate that
+            failed before), only while video is busy, standard client pings arrive and the round trip time is
+            stable. The bitrate never drops below 2 Mbps, or the requested bitrate if that is lower.
+            <br><br>
+            The controller steps aside for the rest of the stream once the client sets the bitrate itself through
+            <code>/bitrate</code>, and stays off for PyroWave and for encoders that would rebuild, with a keyframe,
+            for every change. Loss reports (<code>SS_FRAME_FEC_STATUS</code>) come from Moonlight clients that send
+            them; without them only failed sends can start a cut. With <code>host_adaptive_pacing</code> on as well,
+            the pacing follows the lowered bitrate. The first cut is logged as a warning, later changes at info level.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            host_link_rate_adaptation = true
+            @endcode</td>
+    </tr>
+</table>
+
 ## Config Files
 
 ### file_apps
@@ -3089,6 +3129,10 @@ PyroWave is unchanged. Example: `pacing_group_demand_limit = true`.
         <td colspan="2">
             Percentage of error correcting packets per data packet in each video frame.
             PyroWave ignores this setting; its parity is controlled by `pyrowave_critical_fec_percentage`.
+            @note{A client can ask for its own percentage for its session, from 0 to 255, with the
+            `x-ml-video.fecPercent` RTSP attribute (Moonlight X, Penumbra). That request is used instead of this
+            setting, for both the FEC sent and the bitrate left for FEC overhead. Clients that don't ask get this
+            setting, as before.}
             @warning{Higher values can correct for more network packet loss,
             but at the cost of increasing bandwidth usage.}
         </td>
@@ -4107,6 +4151,36 @@ directly to the NVIDIA Video Codec SDK and is preferred during automatic probing
     </tr>
 </table>
 
+### nvenc_vdd_force_vsync
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Force V-Sync on in the NVIDIA driver's current global profile (NVAPI DRS, as the frame limiter does) while a
+            stream runs on a virtual display, and restore the previous value, or remove the setting if it was
+            not set, when the stream ends. The change goes into the frame limiter's recovery file, so it is also
+            undone after a crash. Some games running DLSS frame generation on a virtual display capture short
+            of their frame rate (for example 110 of 120 fps) unless V-Sync is forced on.
+            @note{This is a system-wide driver setting. Games read it when they start, so a game that was
+            already running must be restarted. [frame_limiter_disable_vsync](#frame_limiter_disable_vsync)
+            takes precedence. Applies only to NVIDIA GPUs on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_vdd_force_vsync = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### nvenc_opengl_vulkan_on_dxgi
 
 <table>
@@ -4157,6 +4231,35 @@ directly to the NVIDIA Video Codec SDK and is preferred during automatic probing
         <td>Example</td>
         <td colspan="2">@code{}
             nvenc_h264_cavlc = disabled
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_subframe
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Send H.264 and HEVC frames in parts while NVENC is still encoding them (sub-frame readback).
+            Each frame is encoded in at least 8 slices, and groups of finished slices go out as the
+            frame's FEC blocks (up to four), so sending overlaps encoding and the client receives the
+            frame sooner. Clients need no changes.
+            Enabling it turns off asynchronous encoding and split-frame encoding for the session.
+            @note{This option only applies to H.264 and HEVC with the NVENC [encoder](#encoder), on GPUs
+            that report sub-frame readback support. AV1 frames are always sent whole.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_subframe = enabled
             @endcode</td>
     </tr>
 </table>
@@ -5303,6 +5406,34 @@ Controls high-motion quality boost for the experimental native AMD encoder. Use 
 
 Sets how long a paused virtual display may remain ready before the display helper releases it. Set `0` to disable the timeout.
 
+### dd_virtual_display_image_width_mm
+
+Sets the width, in millimetres, of the image area the client actually displays. Set `0` to disable.
+
+The stream protocol carries pixels, not physical dimensions, so the host cannot tell a 2504-pixel-wide
+phone panel from a 2504-pixel-wide desktop monitor. Left to itself it guesses a scale from the
+resolution, and buttons, text, and the cursor end up a different physical size on the client than they
+are on the host's own monitor. Measuring the image area once removes the guess: the host derives the
+client's pixel density from it and applies the nearest Windows scale (100% is 96 DPI), so interface
+elements come out close to their physical size. The virtual display's EDID keeps the driver's normal
+monitor dimensions, because encoding the DPI there can make Windows treat the display as a handheld.
+
+Measure the **image area**, not the device. On a letterboxed panel the two differ: a 16:10 stream on the
+8.0-inch inner panel of a Galaxy Z Fold8 Ultra occupies only about 7.01 inches of it. The height is
+derived from the width and the requested mode, so only the width is configured.
+
+Known-good widths, as a starting point — this is an ordinary list, so add your own device by measuring
+its image area:
+
+| Client | Mode | Image area (mm) | Width to configure | Density |
+| --- | --- | --- | --- | --- |
+| Alienware m16 R2 | 2560x1600 | 344.68 x 215.42 | `345` | 188.65 PPI |
+| Galaxy Z Fold8 Ultra (inner panel, landscape) | 2504x2256 | 150.97 x 136.01 | `151` | 421.3 PPI |
+
+`dd_virtual_display_scale` still wins when set to an explicit percentage, and `0` (preserve Windows'
+choice, the default) still leaves the Windows DPI setting alone. The measured width only replaces the
+automatic (`-1`) recommendation.
+
 ### dd_virtual_display_scale
 
 Sets the virtual-display scale override. The default, `0` (Retain), keeps your chosen scale for future streams. On Windows, connect to the virtual display and choose **Scale** in **Settings > System > Display**; subsequent streams using that virtual display retain your choice. Choose an explicit percentage to change desktop scaling without changing the requested pixel resolution. On Windows, scaling is applied through the DPI setter without changing the virtual monitor's reported physical size. The optional `-1` setting chooses a scale based on resolution.
@@ -5442,7 +5573,63 @@ Uses NVIDIA intra refresh instead of full keyframes when supported.
 
 ### nvenc_temporal_aq
 
-Enables NVIDIA temporal adaptive quantization when supported.
+Enables NVIDIA temporal adaptive quantization when supported: more bitrate goes to frames with more
+motion, reducing block-artefact pulsing in moving scenes. Default `disabled`.
+
+### nvenc_aq_strength
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Strength of Spatial AQ from 1 (subtle) to 15 (aggressive).
+            Only applies when [nvenc_spatial_aq](#nvenc_spatial_aq) is enabled. Set to 0 to let the driver decide.
+            Higher values push more bitrate into flat regions, which helps most at low bitrates.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-15</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_aq_strength = 8
+            @endcode</td>
+    </tr>
+</table>
+
+### nvenc_weighted_prediction
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Improves compression of fades and gradual lighting changes using CUDA cores, when the GPU supports it.
+            HEVC split-frame encoding is disabled while it is active.
+            @note{This option only applies when using NVENC [encoder](#encoder).}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_weighted_prediction = disabled
+            @endcode</td>
+    </tr>
+</table>
 
 ### pacing_max_bitrate_kbps
 

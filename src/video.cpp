@@ -54,6 +54,7 @@ extern "C" {
 #include "video_framerate_policy.h"
 #include "video_encoder_probe_policy.h"
 #include "video_policy.h"
+#include "video_subframe.h"
 #include "webrtc_stream.h"
 
 #if defined(__linux__) && defined(SUNSHINE_BUILD_CUDA)
@@ -1331,6 +1332,17 @@ namespace video {
       return device->nvenc->set_bitrate(bitrate_kbps);
     }
 
+    bool step_bitrate(int bitrate_kbps) override {
+      if (!device || !device->nvenc) {
+        return false;
+      }
+      return device->nvenc->set_bitrate(bitrate_kbps, false);
+    }
+
+    bool applies_bitrate_live() const override {
+      return device && device->nvenc;
+    }
+
     void set_hdr_metadata(const SS_HDR_METADATA &metadata) override {
       if (!device || !device->nvenc) {
         return;
@@ -1340,7 +1352,7 @@ namespace video {
       device->nvenc->set_hdr_metadata(metadata);
     }
 
-    nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index) {
+    nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index, const nvenc::nvenc_subframe_callback &on_subframe = {}) {
       if (!device || !device->nvenc) {
         return {};
       }
@@ -1349,7 +1361,7 @@ namespace video {
         return {};
       }
 
-      auto result = device->nvenc->encode_frame(frame_index, force_idr);
+      auto result = device->nvenc->encode_frame(frame_index, force_idr, on_subframe);
       force_idr = false;
       if (!result.data.empty() && result.frame_index != frame_index) {
         // Native NVENC has one synchronous input/output transaction. Delivering
@@ -1419,6 +1431,10 @@ namespace video {
 
     bool set_bitrate(int bitrate_kbps) override {
       return device && device->amf && device->amf->set_bitrate(bitrate_kbps);
+    }
+
+    bool applies_bitrate_live() const override {
+      return device && device->amf;
     }
 
     // Without this the live RTX-HDR refresh path is a no-op on native AMF: the
@@ -1602,6 +1618,8 @@ namespace video {
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;
     safe::mail_raw_t::event_t<int> bitrate_events;
+    safe::mail_raw_t::event_t<int> live_bitrate_events;
+    safe::mail_raw_t::event_t<int> link_rate_bitrate_events;
 
     config_t config;
     int frame_nr;
@@ -3743,10 +3761,63 @@ namespace video {
     std::optional<std::chrono::steady_clock::time_point> capture_timestamp,
     std::optional<std::chrono::steady_clock::time_point> host_processing_timestamp
   ) {
-    auto encoded_frame = session.encode_frame(frame_nr);
+    // With sub-frame readback (nvenc_subframe), groups of slices go to the network thread
+    // as they finish, while the rest is still encoding. See video_subframe.h. Encoder
+    // probes have no session and always get whole frames.
+    std::size_t bytes_sent = 0;
+    int parts_sent = 0;
+    std::uint32_t groups_sent = 0;
+    bool subframe_idr = false;
+    auto send_part = [&](const std::vector<uint8_t> &data, bool final, bool idr, bool after_ref_frame_invalidation) {
+      std::vector<uint8_t> part(std::begin(data) + bytes_sent, std::end(data));
+      bytes_sent = data.size();
+
+      auto packet = std::make_unique<packet_raw_generic>(std::move(part), frame_nr, idr);
+      packet->channel_data = channel_data;
+      packet->after_ref_frame_invalidation = after_ref_frame_invalidation;
+      packet->frame_timestamp = frame_timestamp;
+      packet->capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+      packet->host_processing_timestamp = host_processing_timestamp;
+      packet->subframe_part = parts_sent++;
+      packet->subframe_final = final;
+      packet->subframe_ready = std::chrono::steady_clock::now();
+      packet->packet_enqueue_timestamp = packet->subframe_ready;
+      packets->raise(std::move(packet));
+    };
+    nvenc::nvenc_subframe_callback on_subframe;
+    if (channel_data) {
+      on_subframe = [&](const std::vector<uint8_t> &data, uint32_t slices_done, uint32_t slices_total, bool idr, bool after_ref_frame_invalidation) {
+        subframe_idr = idr;
+        // Groups that finished between polls go out together
+        const auto groups_done = subframe::parts_ready(slices_done, slices_total);
+        if (groups_done > groups_sent) {
+          groups_sent = groups_done;
+          send_part(data, false, idr, after_ref_frame_invalidation);
+        }
+      };
+    }
+
+    auto encoded_frame = session.encode_frame(frame_nr, on_subframe);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
+      // Parts already sent are dropped by the network thread once the next frame starts
       return -1;
+    }
+
+    if (parts_sent > 0) {
+      if (webrtc_stream::has_active_sessions()) {
+        // WebRTC takes whole frames
+        packet_raw_generic whole {std::vector<uint8_t> {encoded_frame.data}, (int64_t) encoded_frame.frame_index, subframe_idr};
+        whole.channel_data = channel_data;
+        whole.after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+        whole.frame_timestamp = frame_timestamp;
+        whole.capture_timestamp = capture_timestamp ? capture_timestamp : frame_timestamp;
+        whole.host_processing_timestamp = host_processing_timestamp;
+        webrtc_stream::submit_video_packet(whole);
+      }
+      // The type the first part went out with
+      send_part(encoded_frame.data, true, subframe_idr, encoded_frame.after_ref_frame_invalidation);
+      return 0;
     }
 
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
@@ -4179,8 +4250,8 @@ namespace video {
       ctx->height = config.height;
       ctx->time_base = AVRational {1, config.framerate};
       ctx->framerate = AVRational {config.framerate, 1};
-      if (config.framerateX100 > 0) {
-        AVRational fps = video::framerateX100_to_rational(config.framerateX100);
+      if (video::has_exact_framerate(config)) {
+        AVRational fps = video::exact_framerate_to_rational(config);
         ctx->framerate = fps;
         ctx->time_base = AVRational {fps.den, fps.num};
       }
@@ -5087,6 +5158,29 @@ namespace video {
     initialization_failed,
   };
 
+  /**
+   * @brief Tell the stream whether this encoder applies a runtime bitrate in place.
+   * @note Only ever falls: once an encoder had to rebuild to apply one, host link
+   *       rate adaptation stays off rather than cost a keyframe with every change.
+   */
+  /// The last bitrate queued on `events`, if any: a burst costs one change.
+  static std::optional<int> latest_kbps(safe::mail_raw_t::event_t<int> &events) {
+    std::optional<int> latest;
+    while (events->peek()) {
+      if (auto kbps = events->pop(0ms)) {
+        latest = *kbps;
+      }
+    }
+    return latest;
+  }
+
+  static void publish_live_bitrate(safe::mail_raw_t::event_t<int> &events, bool live) {
+    // An int, not a bool: a bool event cannot carry `false`.
+    events->raise_monotonic(live ? 1 : 0, [](int candidate, int last) {
+      return candidate > last;
+    });
+  }
+
   encode_run_result_e encode_run(
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
@@ -5357,6 +5451,9 @@ namespace video {
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto bitrate_events = mail->event<int>(mail::dynamic_bitrate);
+    auto live_bitrate_events = mail->event<int>(mail::live_bitrate);
+    auto link_rate_bitrate_events = mail->event<int>(mail::link_rate_bitrate);
+    publish_live_bitrate(live_bitrate_events, session->applies_bitrate_live());
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -5520,6 +5617,18 @@ namespace video {
           BOOST_LOG(info) << "Applied runtime bitrate "sv << *latest_bitrate << " kbps (live)"sv;
         } else if (frame_nr > 1) {
           BOOST_LOG(info) << "Rebuilding encoder to apply runtime bitrate "sv << *latest_bitrate << " kbps"sv;
+          publish_live_bitrate(live_bitrate_events, false);
+          break;
+        }
+      }
+      // Host link rate steps; a client bitrate in the same pass wins.
+      if (const auto stepped = latest_kbps(link_rate_bitrate_events); stepped && !latest_bitrate) {
+        config.bitrate = *stepped;
+        if (session->step_bitrate(*stepped)) {
+          BOOST_LOG(debug) << "Applied link rate bitrate "sv << *stepped << " kbps (live)"sv;
+        } else if (frame_nr > 1) {
+          BOOST_LOG(info) << "Rebuilding encoder to apply link rate bitrate "sv << *stepped << " kbps"sv;
+          publish_live_bitrate(live_bitrate_events, false);
           break;
         }
       }
@@ -6007,6 +6116,9 @@ namespace video {
     }
     raise_hdr_info_if_changed(ctx.hdr_events, ctx.last_hdr_info, std::move(hdr_info));
 
+    if (ctx.live_bitrate_events) {
+      publish_live_bitrate(ctx.live_bitrate_events, session->applies_bitrate_live());
+    }
     encode_session.bootstrap.allow_placeholder_before_first_real = ctx.frame_nr <= 1;
     encode_session.session = std::move(session);
 
@@ -6190,6 +6302,7 @@ namespace video {
             pos->session->request_idr_frame();
             ctx->idr_events->pop();
           }
+          bool client_bitrate = false;
           if (ctx->bitrate_events->peek()) {
             // Coalesce rapid ABR updates to the latest requested value.
             std::optional<int> latest_bitrate;
@@ -6199,6 +6312,7 @@ namespace video {
               }
             }
             if (latest_bitrate) {
+              client_bitrate = true;
               ctx->config.bitrate = *latest_bitrate;
               ctx->config.client_requested_bitrate = *latest_bitrate;
               if (pos->session->set_bitrate(*latest_bitrate)) {
@@ -6206,6 +6320,26 @@ namespace video {
               } else {
                 // avcodec encoder: rebuild synced sessions from their (now-updated) ctx config.
                 BOOST_LOG(info) << "Rebuilding encoder to apply runtime bitrate "sv << *latest_bitrate << " kbps (sync)"sv;
+                if (ctx->live_bitrate_events) {
+                  publish_live_bitrate(ctx->live_bitrate_events, false);
+                }
+                ec = platf::capture_e::reinit;
+                return false;
+              }
+            }
+          }
+
+          if (ctx->link_rate_bitrate_events) {
+            // Host link rate steps; a client bitrate in the same pass wins.
+            if (const auto stepped = latest_kbps(ctx->link_rate_bitrate_events); stepped && !client_bitrate) {
+              ctx->config.bitrate = *stepped;
+              if (pos->session->step_bitrate(*stepped)) {
+                BOOST_LOG(debug) << "Applied link rate bitrate "sv << *stepped << " kbps (live, sync)"sv;
+              } else {
+                BOOST_LOG(info) << "Rebuilding encoder to apply link rate bitrate "sv << *stepped << " kbps (sync)"sv;
+                if (ctx->live_bitrate_events) {
+                  publish_live_bitrate(ctx->live_bitrate_events, false);
+                }
                 ec = platf::capture_e::reinit;
                 return false;
               }
@@ -6923,6 +7057,8 @@ namespace video {
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
         mail->event<int>(mail::dynamic_bitrate),
+        mail->event<int>(mail::live_bitrate),
+        mail->event<int>(mail::link_rate_bitrate),
         config,
         1,
         channel_data,

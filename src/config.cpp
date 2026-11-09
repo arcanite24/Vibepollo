@@ -866,6 +866,7 @@ namespace config {
     true,  // nv_realtime_hags
     true,  // nv_opengl_vulkan_on_dxgi
     true,  // nv_sunshine_high_power_mode
+    false,  // nv_vdd_force_vsync
     {},  // nv_legacy
 
     {
@@ -966,6 +967,7 @@ namespace config {
       true,  // use_sunshine_virtual_display_driver
       false,  // activate_virtual_display
       0,  // virtual_display_scale_percent
+      0,  // virtual_display_image_width_mm
       0,  // virtual_display_permanent_count
       false,  // virtual_display_permanent_count_configured
       {},  // virtual_display_outputs (Linux; empty auto-discovers Vibepollo VKMS connectors)
@@ -1004,6 +1006,7 @@ namespace config {
     false,  // pacing_batch_demand_limit (experimental per-call demand-based sizing; default off)
     false,  // pacing_group_demand_limit (experimental per-frame group pacing; default off)
     false,  // host_adaptive_pacing (experimental loss-responsive packet spacing; default off)
+    false,  // host_link_rate_adaptation (experimental encoder bitrate adaptation to the link; default off)
     20,  // pyrowave_critical_fec_percentage
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
@@ -1804,12 +1807,16 @@ namespace config {
     int_between_f(vars, "nvenc_vbv_increase", video.nv.vbv_percentage_increase, {0, 400});
     bool_f(vars, "nvenc_spatial_aq", video.nv.adaptive_quantization);
     bool_f(vars, "nvenc_temporal_aq", video.nv.temporal_aq);
+    int_between_f(vars, "nvenc_aq_strength", video.nv.aq_strength, {0, 15});
+    bool_f(vars, "nvenc_weighted_prediction", video.nv.weighted_prediction);
     generic_f(vars, "nvenc_split_encode", video.nv.split_encode_mode, nv::split_encode_mode_from_view);
     generic_f(vars, "nvenc_twopass", video.nv.two_pass, nv::twopass_from_view);
     bool_f(vars, "nvenc_h264_cavlc", video.nv.h264_cavlc);
     bool_f(vars, "nvenc_intra_refresh", video.nv.intra_refresh);
+    bool_f(vars, "nvenc_subframe", video.nv.subframe_readback);
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
+    bool_f(vars, "nvenc_vdd_force_vsync", video.nv_vdd_force_vsync);
     bool_f(vars, "nvenc_latency_over_power", video.nv_sunshine_high_power_mode);
 
 #if !defined(__ANDROID__) && !defined(__APPLE__)
@@ -1997,6 +2004,18 @@ namespace config {
       } else {
         BOOST_LOG(warning) << "Ignoring unsupported virtual display scale " << value
                            << "%; use -1 (recommended), 0, 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, or 500.";
+      }
+    }
+    {
+      int value = video.dd.virtual_display_image_width_mm;
+      int_f(vars, "dd_virtual_display_image_width_mm", value);
+      // Mirrors VDISPLAY::kMinImageWidthMillimeters/kMaxImageWidthMillimeters, which live in a
+      // Windows-only header this platform-neutral parser cannot include.
+      if (value == 0 || (value >= 10 && value <= 2000)) {
+        video.dd.virtual_display_image_width_mm = value;
+      } else {
+        BOOST_LOG(warning) << "Ignoring out-of-range virtual display image width " << value
+                           << " mm; use 0 to disable, or 10-2000.";
       }
     }
     bool_f(vars, "vulkan_hdr_layer", video.dd.vulkan_hdr_layer);
@@ -2226,6 +2245,7 @@ namespace config {
     bool_f(vars, "pacing_batch_demand_limit", stream.pacing_batch_demand_limit);
     bool_f(vars, "pacing_group_demand_limit", stream.pacing_group_demand_limit);
     bool_f(vars, "host_adaptive_pacing", stream.host_adaptive_pacing);
+    bool_f(vars, "host_link_rate_adaptation", stream.host_link_rate_adaptation);
     if (stream.video_max_batch_size_kb == 0) {
       stream.video_max_batch_size_kb = 64;
     } else if (stream.video_max_batch_size_kb != 16 && stream.video_max_batch_size_kb != 32 && stream.video_max_batch_size_kb != 64) {
@@ -2670,6 +2690,8 @@ namespace config {
     adapter_config_pair_t g_base_adapter_config;
     adapter_config_pair_t g_active_adapter_config;
     bool g_base_adapter_config_valid = false;
+    video_t::dd_t::hdr_request_override_e g_base_hdr_request_override =
+      video_t::dd_t::hdr_request_override_e::automatic;
     bool g_active_adapter_config_valid = false;
 
     adapter_config_pair_t adapter_config_from_vars(
@@ -2693,6 +2715,10 @@ namespace config {
       std::lock_guard<std::mutex> lock(g_adapter_config_snapshot_mutex);
       g_base_adapter_config = adapter_config_from_vars(vars);
       g_base_adapter_config_valid = true;
+      const auto hdr_override = vars.find("dd_hdr_request_override");
+      g_base_hdr_request_override = dd::hdr_request_override_from_view(
+        hdr_override != vars.end() ? std::string_view {hdr_override->second} : "auto"sv
+      );
     }
 
 #ifdef _WIN32
@@ -2788,6 +2814,7 @@ namespace config {
         "dd_use_sunshine_virtual_display_driver",
         "dd_activate_virtual_display",
         "dd_virtual_display_scale",
+        "dd_virtual_display_image_width_mm",
         "dd_virtual_display_permanent_count",
         "virtual_display_outputs",
         "dd_mode_remapping",
@@ -2801,6 +2828,7 @@ namespace config {
         "pacing_batch_demand_limit",
         "pacing_group_demand_limit",
         "host_adaptive_pacing",
+        "host_link_rate_adaptation",
         "pyrowave_critical_fec_percentage",
         "qp",
         "min_threads",
@@ -2827,12 +2855,16 @@ namespace config {
         "nvenc_twopass",
         "nvenc_spatial_aq",
         "nvenc_temporal_aq",
+        "nvenc_aq_strength",
+        "nvenc_weighted_prediction",
         "nvenc_split_encode",
         "nvenc_vbv_increase",
         "nvenc_realtime_hags",
         "nvenc_latency_over_power",
         "nvenc_opengl_vulkan_on_dxgi",
+        "nvenc_vdd_force_vsync",
         "nvenc_h264_cavlc",
+        "nvenc_subframe",
         "qsv_preset",
         "qsv_coder",
         "qsv_slow_hevc",
@@ -3151,6 +3183,11 @@ namespace config {
     g_active_adapter_config_valid = true;
   }
 
+  video_t::dd_t::hdr_request_override_e base_hdr_request_override() {
+    std::lock_guard<std::mutex> lock(g_adapter_config_snapshot_mutex);
+    return g_base_hdr_request_override;
+  }
+
   void merge_config_overrides(
     std::unordered_map<std::string, std::string> &base,
     const std::unordered_map<std::string, std::string> &overrides
@@ -3332,6 +3369,7 @@ namespace config {
       const auto prev_dd_use_sunshine_virtual_display_driver = video.dd.use_sunshine_virtual_display_driver;
       const auto prev_dd_activate_virtual_display = video.dd.activate_virtual_display;
       const auto prev_dd_virtual_display_scale_percent = video.dd.virtual_display_scale_percent;
+      const auto prev_dd_virtual_display_image_width_mm = video.dd.virtual_display_image_width_mm;
       const auto prev_dd_virtual_display_permanent_count = video.dd.virtual_display_permanent_count;
       const auto prev_dd_virtual_display_permanent_count_configured = video.dd.virtual_display_permanent_count_configured;
       const auto prev_virtual_display_outputs = video.dd.virtual_display_outputs;
@@ -3419,6 +3457,7 @@ namespace config {
                                        (prev_dd_use_sunshine_virtual_display_driver != video.dd.use_sunshine_virtual_display_driver) ||
                                        (prev_dd_activate_virtual_display != video.dd.activate_virtual_display) ||
                                        (prev_dd_virtual_display_scale_percent != video.dd.virtual_display_scale_percent) ||
+                                       (prev_dd_virtual_display_image_width_mm != video.dd.virtual_display_image_width_mm) ||
                                        (prev_dd_virtual_display_permanent_count != video.dd.virtual_display_permanent_count) ||
                                        (prev_dd_virtual_display_permanent_count_configured != video.dd.virtual_display_permanent_count_configured) ||
                                        (prev_virtual_display_outputs != video.dd.virtual_display_outputs) ||

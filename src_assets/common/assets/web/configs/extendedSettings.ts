@@ -22,6 +22,7 @@ export const extendedDefaults: Record<string, unknown> = {
   nvenc_realtime_hags: 'enabled',
   nvenc_latency_over_power: 'enabled',
   nvenc_opengl_vulkan_on_dxgi: 'enabled',
+  nvenc_vdd_force_vsync: 'disabled',
   nvenc_h264_cavlc: 'disabled',
   nvenc_subframe: 'disabled',
   qsv_preset: 'medium',

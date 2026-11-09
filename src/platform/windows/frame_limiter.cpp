@@ -81,6 +81,7 @@ namespace platf {
     bool g_nvcp_started = false;
     bool g_rtss_cleanup_needed = false;
     bool g_nvcp_force_vsync_off = false;
+    bool g_nvcp_force_vsync_on = false;
     bool g_nvcp_apply_smooth_motion = false;
     bool g_gen1_framegen_fix_active = false;
     bool g_gen2_framegen_fix_active = false;
@@ -308,7 +309,12 @@ namespace platf {
     // Frame generation pacing must respect the separate VSYNC preference.
     // The dummy-plug HDR workaround already sets this preference in config.
     const bool want_nv_vsync_override = config::frame_limiter.disable_vsync && nvidia_gpu_present && nvcp_ready;
+    // nvenc_vdd_force_vsync: some games capture short of their frame rate on a virtual display
+    // (DLSS frame generation) unless V-Sync is forced on in the driver. Disabling V-Sync wins.
+    const bool want_nv_vsync_on = !want_nv_vsync_override && config::video.nv_vdd_force_vsync &&
+                                  policy.uses_virtual_display && nvidia_gpu_present && nvcp_ready;
     g_nvcp_force_vsync_off = want_nv_vsync_override;
+    g_nvcp_force_vsync_on = want_nv_vsync_on;
     g_nvcp_apply_smooth_motion = want_smooth_motion;
 
     bool nvcp_already_invoked = false;
@@ -346,6 +352,7 @@ namespace platf {
                      << " stream_adapter_vendor=" << stream_adapter.vendor_id
                      << " nvcp_ready=" << nvcp_ready
                      << " want_nv_vsync_override=" << want_nv_vsync_override
+                     << " want_nv_vsync_on=" << want_nv_vsync_on
                      << " want_smooth_motion=" << want_smooth_motion;
 
     if (frame_limit_enabled) {
@@ -403,7 +410,8 @@ namespace platf {
             false,
             want_nv_vsync_override,
             false,
-            want_smooth_motion
+            want_smooth_motion,
+            want_nv_vsync_on
           );
           if (ok) {
             g_active_provider = frame_limiter_provider::nvidia_control_panel;
@@ -447,14 +455,15 @@ namespace platf {
 
     const bool want_disable_nv_frame_limit = g_active_provider == frame_limiter_provider::rtss && nvidia_gpu_present && nvcp_ready;
 
-    if ((want_disable_nv_frame_limit || want_nv_vsync_override || want_smooth_motion) && !nvcp_already_invoked) {
+    if ((want_disable_nv_frame_limit || want_nv_vsync_override || want_nv_vsync_on || want_smooth_motion) && !nvcp_already_invoked) {
       bool nvcp_result = frame_limiter_nvcp::streaming_start(
         effective_limit.nvcp_fps,
         false,
         want_disable_nv_frame_limit,
         want_nv_vsync_override,
         false,
-        want_smooth_motion
+        want_smooth_motion,
+        want_nv_vsync_on
       );
       nvcp_already_invoked = true;
       if (want_smooth_motion && !nvcp_result) {
@@ -566,6 +575,7 @@ namespace platf {
     g_nvcp_started = false;
     g_rtss_cleanup_needed = false;
     g_nvcp_force_vsync_off = false;
+    g_nvcp_force_vsync_on = false;
     g_nvcp_apply_smooth_motion = false;
     g_last_effective_limit = {};
   }
@@ -599,7 +609,8 @@ namespace platf {
             false,
             g_nvcp_force_vsync_off,
             false,
-            g_nvcp_apply_smooth_motion
+            g_nvcp_apply_smooth_motion,
+            g_nvcp_force_vsync_on
           )) {
         g_active_provider = frame_limiter_provider::nvidia_control_panel;
         g_nvcp_started = true;

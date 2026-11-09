@@ -916,6 +916,8 @@
     "nvenc_latency_over_power": "Prefer lower encoding latency over power savings",
     "nvenc_latency_over_power_desc": "Vibepollo requests maximum GPU clock speed while streaming to reduce encoding latency. Disabling it is not recommended since this can lead to significantly increased encoding latency.",
     "nvenc_opengl_vulkan_on_dxgi": "Present OpenGL/Vulkan on top of DXGI",
+    "nvenc_vdd_force_vsync": "Force NVIDIA V-Sync for virtual display streams",
+    "nvenc_vdd_force_vsync_desc": "While a stream runs on a virtual display, force V-Sync on in the NVIDIA driver's current global profile, and restore the previous setting when the stream ends. Helps games with DLSS frame generation that otherwise capture short of their frame rate. This is a system-wide driver setting; games read it when they start, so restart a game that was already running. Disable VSYNC in the frame limiter settings takes precedence.",
     "nvenc_opengl_vulkan_on_dxgi_desc": "Vibepollo can't capture fullscreen OpenGL and Vulkan programs at full frame rate unless they present on top of DXGI. This is system-wide setting that is reverted on sunshine program exit.",
     "nvenc_preset": "Performance preset",
     "nvenc_preset_1": "(fastest, default)",

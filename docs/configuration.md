@@ -4111,6 +4111,36 @@ directly to the NVIDIA Video Codec SDK and is preferred during automatic probing
     </tr>
 </table>
 
+### nvenc_vdd_force_vsync
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Force V-Sync on in the NVIDIA driver's current global profile (NVAPI DRS, as the frame limiter does) while a
+            stream runs on a virtual display, and restore the previous value, or remove the setting if it was
+            not set, when the stream ends. The change goes into the frame limiter's recovery file, so it is also
+            undone after a crash. Some games running DLSS frame generation on a virtual display capture short
+            of their frame rate (for example 110 of 120 fps) unless V-Sync is forced on.
+            @note{This is a system-wide driver setting. Games read it when they start, so a game that was
+            already running must be restarted. [frame_limiter_disable_vsync](#frame_limiter_disable_vsync)
+            takes precedence. Applies only to NVIDIA GPUs on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            nvenc_vdd_force_vsync = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### nvenc_opengl_vulkan_on_dxgi
 
 <table>

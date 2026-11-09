@@ -866,6 +866,7 @@ namespace config {
     true,  // nv_realtime_hags
     true,  // nv_opengl_vulkan_on_dxgi
     true,  // nv_sunshine_high_power_mode
+    false,  // nv_vdd_force_vsync
     {},  // nv_legacy
 
     {
@@ -1814,6 +1815,7 @@ namespace config {
     bool_f(vars, "nvenc_subframe", video.nv.subframe_readback);
     bool_f(vars, "nvenc_realtime_hags", video.nv_realtime_hags);
     bool_f(vars, "nvenc_opengl_vulkan_on_dxgi", video.nv_opengl_vulkan_on_dxgi);
+    bool_f(vars, "nvenc_vdd_force_vsync", video.nv_vdd_force_vsync);
     bool_f(vars, "nvenc_latency_over_power", video.nv_sunshine_high_power_mode);
 
 #if !defined(__ANDROID__) && !defined(__APPLE__)
@@ -2857,6 +2859,7 @@ namespace config {
         "nvenc_realtime_hags",
         "nvenc_latency_over_power",
         "nvenc_opengl_vulkan_on_dxgi",
+        "nvenc_vdd_force_vsync",
         "nvenc_h264_cavlc",
         "nvenc_subframe",
         "qsv_preset",

@@ -80,6 +80,7 @@ namespace config {
     bool nv_realtime_hags;
     bool nv_opengl_vulkan_on_dxgi;
     bool nv_sunshine_high_power_mode;
+    bool nv_vdd_force_vsync;  ///< Force NVIDIA global V-Sync on (NVAPI DRS) while a virtual-display stream runs; restored when it ends.
 
     struct {
       int preset;

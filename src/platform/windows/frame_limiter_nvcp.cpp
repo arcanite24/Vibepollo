@@ -1064,7 +1064,7 @@ namespace platf::frame_limiter_nvcp {
     return status == NVAPI_OK;
   }
 
-  bool streaming_start(int fps, bool apply_frame_limit, bool force_frame_limit_off, bool force_vsync_off, bool force_low_latency_off, bool apply_smooth_motion) {
+  bool streaming_start(int fps, bool apply_frame_limit, bool force_frame_limit_off, bool force_vsync_off, bool force_low_latency_off, bool apply_smooth_motion, bool force_vsync_on) {
     std::scoped_lock lock(g_mutex);
     maybe_restore_from_overrides_file();
 
@@ -1091,7 +1091,11 @@ namespace platf::frame_limiter_nvcp {
     g_state.original_smooth_motion_override = false;
     g_state.original_smooth_motion_mask_override = false;
 
-    if (!apply_frame_limit && !force_frame_limit_off && !force_vsync_off && !force_low_latency_off && !apply_smooth_motion) {
+    if (force_vsync_off) {
+      force_vsync_on = false;
+    }
+
+    if (!apply_frame_limit && !force_frame_limit_off && !force_vsync_off && !force_vsync_on && !force_low_latency_off && !apply_smooth_motion) {
       return false;
     }
 
@@ -1151,7 +1155,9 @@ namespace platf::frame_limiter_nvcp {
       }
     }
 
-    if (force_vsync_off) {
+    if (force_vsync_off || force_vsync_on) {
+      // The previous value (or its absence) is kept with the other overrides, written to the
+      // recovery file and restored when the stream ends.
       NvAPI_Status status = get_current_setting(VSYNCMODE_ID, g_state.original_vsync);
       if (status != NVAPI_OK) {
         log_nvapi_error(status, "DRS_GetSetting(VSYNCMODE)");
@@ -1161,7 +1167,7 @@ namespace platf::frame_limiter_nvcp {
         setting.settingId = VSYNCMODE_ID;
         setting.settingType = NVDRS_DWORD_TYPE;
         setting.settingLocation = NVDRS_CURRENT_PROFILE_LOCATION;
-        setting.u32CurrentValue = VSYNCMODE_FORCEOFF;
+        setting.u32CurrentValue = force_vsync_off ? VSYNCMODE_FORCEOFF : VSYNCMODE_FORCEON;
 
         status = drs_set_setting(g_state.session, g_state.profile, &setting);
         if (status != NVAPI_OK) {
@@ -1169,7 +1175,7 @@ namespace platf::frame_limiter_nvcp {
         } else {
           g_state.vsync_applied = true;
           dirty = true;
-          BOOST_LOG(info) << "NVIDIA Control Panel VSYNC forced off for stream";
+          BOOST_LOG(info) << "NVIDIA Control Panel VSYNC forced " << (force_vsync_off ? "off" : "on") << " for stream";
         }
       }
     }

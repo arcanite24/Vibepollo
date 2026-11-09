@@ -518,7 +518,48 @@ namespace stream {
     AUDIO_FEC_HEADER fecHeader;
   };
 
+  /**
+   * @brief Clock sync request a client sends to the video port.
+   *
+   * @details Wire-compatible with MoreOrLessSoftware/Sunshine and the moonlight-common-c clock
+   *          sync (SS_CLOCK_SYNC_REQUEST). It starts like a ping, so hosts that don't know it treat
+   *          it as one. The host answers with clock_sync_reply_t, from which the client works out
+   *          the offset between its clock and the host's RTP video timestamps, NTP-style. Clients
+   *          stop sending these when no reply comes, so stock clients never see a reply.
+   */
+  struct clock_sync_request_t {
+    char payload[16];  ///< The session's video ping payload, which identifies it.
+    boost::endian::little_uint32_at magic;  ///< CLOCK_SYNC_REQUEST_MAGIC.
+    boost::endian::little_uint32_at sequence;  ///< Echoed in the reply.
+    boost::endian::little_uint64_at client_send_us;  ///< Client's send time, echoed in the reply.
+  };
+
+  /**
+   * @brief Host's answer to clock_sync_request_t, sent to the session's own video endpoint.
+   *
+   * @details Host times are microseconds since the zero point of the RTP video timestamps, on
+   *          the clock they come from. The magic's first byte can't start an RTP version 2 packet
+   *          and the reply is shorter than any encrypted video packet, so a client tells it from
+   *          video without decrypting.
+   */
+  struct clock_sync_reply_t {
+    boost::endian::little_uint32_at magic;  ///< CLOCK_SYNC_REPLY_MAGIC.
+    boost::endian::little_uint32_at sequence;  ///< The request's sequence.
+    boost::endian::little_uint64_at client_send_us;  ///< The request's client send time.
+    boost::endian::little_uint64_at host_receive_us;  ///< When the request arrived.
+    boost::endian::little_uint64_at host_send_us;  ///< When this reply was sent.
+  };
+
+  static_assert(sizeof(clock_sync_request_t) == 32, "Clock sync request must be 32 bytes");
+  static_assert(sizeof(clock_sync_reply_t) == 32, "Clock sync reply must be 32 bytes");
+
 #pragma pack(pop)
+
+  constexpr std::uint32_t CLOCK_SYNC_REQUEST_MAGIC = 0x53434C4D;  ///< "MLCS" in memory.
+  constexpr std::uint32_t CLOCK_SYNC_REPLY_MAGIC = 0x4B434C4D;  ///< "MLCK" in memory.
+
+  // Answering faster than this would only let a client make the host send for it.
+  constexpr auto CLOCK_SYNC_MIN_INTERVAL = std::chrono::milliseconds(10);
 
   constexpr std::size_t round_to_pkcs7_padded(std::size_t size) {
     return ((size + 15) / 16) * 16;
@@ -628,6 +669,9 @@ namespace stream {
 
     asio::io_context io_context;
 
+    // Zero point of the RTP video timestamps, shared with clock sync replies.
+    std::chrono::steady_clock::time_point video_epoch;
+
     udp::socket video_sock {io_context};
     udp::socket audio_sock {io_context};
 
@@ -676,6 +720,8 @@ namespace stream {
 
       std::uint32_t lowseq;
       udp::endpoint peer;
+      // When a clock sync request was last answered. Receive thread only, under _sessions.
+      std::chrono::steady_clock::time_point last_clock_sync;
 
       std::optional<crypto::cipher::gcm_t> cipher;
       std::uint64_t gcm_iv_counter;
@@ -2301,8 +2347,56 @@ namespace stream {
       }
     };
 
+    auto to_epoch_us = [&](std::chrono::steady_clock::time_point time) {
+      return (std::uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(time - ctx.video_epoch).count();
+    };
+
+    // Answers a clock sync request from a running session, to its own video endpoint only, so
+    // a forged source address can't aim replies anywhere else. A reply is no larger than the
+    // request it answers, and a session gets at most one every CLOCK_SYNC_MIN_INTERVAL.
+    auto answer_clock_sync = [&](const clock_sync_request_t &request, const udp::endpoint &peer, std::chrono::steady_clock::time_point received) {
+      const std::string session_id {request.payload, sizeof(request.payload)};
+
+      auto lg = ctx.control_server._sessions.lock();
+      for (auto *session : *ctx.control_server._sessions) {
+        if (session->video.ping_payload != session_id) {
+          continue;
+        }
+
+        if (session->video.peer.port() == 0 || session->video.peer.address() != peer.address() ||
+            received - session->video.last_clock_sync < CLOCK_SYNC_MIN_INTERVAL) {
+          return;
+        }
+        session->video.last_clock_sync = received;
+
+        clock_sync_reply_t reply {};
+        reply.magic = CLOCK_SYNC_REPLY_MAGIC;
+        reply.sequence = request.sequence;
+        reply.client_send_us = request.client_send_us;
+        reply.host_receive_us = to_epoch_us(received);
+
+        auto peer_address = session->video.peer.address();
+        auto send_info = platf::send_info_t {
+          nullptr,
+          0,
+          (const char *) &reply,
+          sizeof(reply),
+          (uintptr_t) video_sock.native_handle(),
+          peer_address,
+          session->video.peer.port(),
+          session->localAddress,
+        };
+
+        // Stamped as late as possible, so the time spent here counts as the host's.
+        reply.host_send_us = to_epoch_us(std::chrono::steady_clock::now());
+        platf::send(send_info);
+        return;
+      }
+    };
+
     auto recv_func_init = [&](udp::socket &sock, int buf_elem, std::map<av_session_id_t, message_queue_t> &peer_to_session) {
       recv_func[buf_elem] = [&, buf_elem](const boost::system::error_code &ec, size_t bytes) {
+        const auto received = std::chrono::steady_clock::now();
         // Snapshot this sender before rearming the socket's receive.
         const auto peer = peers[buf_elem];
         auto fg = util::fail_guard([&]() {
@@ -2325,6 +2419,16 @@ namespace stream {
         }
 
         (buf_elem ? ctx.audio_recv_count : ctx.video_recv_count).fetch_add(1, std::memory_order_relaxed);
+
+        // Clock sync requests (sent only by clients that support them) are answered here
+        // and are not treated as pings.
+        if (buf_elem == 0 && bytes == sizeof(clock_sync_request_t)) {
+          const auto request = (const clock_sync_request_t *) buf[buf_elem].data();
+          if (request->magic == CLOCK_SYNC_REQUEST_MAGIC) {
+            answer_clock_sync(*request, peer, received);
+            return;
+          }
+        }
 
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
@@ -2355,10 +2459,9 @@ namespace stream {
     }
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoBroadcastThread(udp::socket &sock, std::chrono::steady_clock::time_point video_epoch) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
 
     // Video traffic is sent on this thread. The send pacer (pacing_max_bitrate_kbps)
     // relies on this thread waking on its millisecond sleep deadlines; losing the
@@ -3472,7 +3575,8 @@ namespace stream {
     // After calling stop(), restart() must be called before run() will work again.
     ctx.io_context.restart();
 
-    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_epoch = std::chrono::steady_clock::now();
+    ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock), ctx.video_epoch};
     ctx.audio_thread = std::thread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 

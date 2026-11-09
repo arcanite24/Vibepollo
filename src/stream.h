@@ -59,6 +59,9 @@ namespace stream {
 
     int packetsize;
     int minRequiredFecPackets;
+    // Percentage of FEC packets added to each video frame: the client's
+    // x-ml-video.fecPercent request, or the host's fec_percentage.
+    int fecPercentage = 0;
     int mlFeatureFlags;
     int controlProtocolType;
     int audioQosType;

@@ -2346,6 +2346,7 @@ namespace rtsp_stream {
     args.try_emplace("x-nv-vqos[0].qosTrafficType"sv, "5"sv);
     args.try_emplace("x-nv-aqos.qosTrafficType"sv, "4"sv);
     args.try_emplace("x-ml-video.configuredBitrateKbps"sv, "0"sv);
+    args.try_emplace("x-ml-video.fecPercent"sv, "-1"sv);
     args.try_emplace("x-ss-general.encryptionEnabled"sv, "0"sv);
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
@@ -2357,6 +2358,7 @@ namespace rtsp_stream {
     config.frame_generation_enabled = false;
 
     std::int64_t configuredBitrateKbps;
+    std::int64_t requestedFecPercentage = -1;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session->host_audio;
     try {
       config.audio.channels = (int) util::from_view(args.at("x-nv-audio.surround.numChannels"sv));
@@ -2387,6 +2389,7 @@ namespace rtsp_stream {
       }
 
       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
+      requestedFecPercentage = util::from_view(args.at("x-ml-video.fecPercent"sv));
       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
@@ -2468,6 +2471,18 @@ namespace rtsp_stream {
     } catch (std::out_of_range &) {
       respond(socket->sock, *session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return false;
+    }
+
+    // A client may ask for its own FEC percentage (x-ml-video.fecPercent, as sent by
+    // MoreOrLess/Moonlight X and Penumbra), as it knows how lossy its network is. Clients
+    // that don't ask get fec_percentage exactly as before.
+    config.fecPercentage = stream::session_fec_percentage((int) std::clamp<std::int64_t>(requestedFecPercentage, -1, 256), config::stream.fec_percentage);
+    if (requestedFecPercentage >= 0) {
+      if (config.fecPercentage == requestedFecPercentage) {
+        BOOST_LOG(info) << "Client requested "sv << requestedFecPercentage << "% FEC"sv;
+      } else {
+        BOOST_LOG(warning) << "Client requested "sv << requestedFecPercentage << "% FEC, which is out of range; using "sv << config.fecPercentage << '%';
+      }
     }
 
     // When using stereo audio, the audio quality is (strangely) indicated by whether the Host field
@@ -2657,8 +2672,8 @@ namespace rtsp_stream {
       // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
       // PyroWave only adds parity to its few critical packets (see stream.cpp), so it
       // reserves its baseline parity and packet overhead in the per-frame budget.
-      if (config::stream.fec_percentage <= 80 && !pyrowave_session) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+      if (config.fecPercentage <= 80 && !pyrowave_session) {
+        configuredBitrateKbps /= 100.f / (100 - config.fecPercentage);
       }
 
       // Account for the selected audio codec's bitrate without changing the Opus calculation.

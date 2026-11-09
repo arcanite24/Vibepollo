@@ -61,6 +61,18 @@ namespace stream {
   video_pacing_reservation_t video_pacing_reservation(int ceiling_kbps, const video_pacing_demand_t &demand);
   bool reserve_video_pacing_capacity(std::uint64_t &used_ns_per_second, const video_pacing_reservation_t &reservation);
 
+  /**
+   * @brief Choose the FEC percentage for a session.
+   *
+   * @param requested Percentage the client asked for (x-ml-video.fecPercent), or a negative value if it didn't ask.
+   * @param host_default The host's fec_percentage.
+   * @return The client's request when it is from 0 to 255, otherwise the host's.
+   */
+  inline int session_fec_percentage(int requested, int host_default) {
+    // The client may turn FEC off (0) for itself; the host's own setting starts at 1.
+    return requested >= 0 && requested <= 255 ? requested : host_default;
+  }
+
   inline std::string canonical_codec_name(std::string_view codec) {
     if (codec.empty()) {
       return {};

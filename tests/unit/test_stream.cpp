@@ -37,6 +37,23 @@ namespace {
   constexpr auto haptics_time = std::chrono::steady_clock::time_point {};
 }  // namespace
 
+TEST(SessionFecPercentageTests, UsesTheHostsWhenTheClientDoesNotAsk) {
+  EXPECT_EQ(stream::session_fec_percentage(-1, 20), 20);
+}
+
+TEST(SessionFecPercentageTests, UsesTheClientsRequest) {
+  EXPECT_EQ(stream::session_fec_percentage(5, 20), 5);
+  EXPECT_EQ(stream::session_fec_percentage(255, 20), 255);
+}
+
+TEST(SessionFecPercentageTests, AllowsTheClientToTurnFecOff) {
+  EXPECT_EQ(stream::session_fec_percentage(0, 20), 0);
+}
+
+TEST(SessionFecPercentageTests, IgnoresRequestsAboveTheHostsRange) {
+  EXPECT_EQ(stream::session_fec_percentage(256, 20), 20);
+}
+
 TEST(HapticsGain, UnityPreservesEverySampleBit) {
   auto packet = haptics_packet(-32768, 32767);
   set_haptics_sample(packet, 2, -1);

@@ -3089,6 +3089,10 @@ PyroWave is unchanged. Example: `pacing_group_demand_limit = true`.
         <td colspan="2">
             Percentage of error correcting packets per data packet in each video frame.
             PyroWave ignores this setting; its parity is controlled by `pyrowave_critical_fec_percentage`.
+            @note{A client can ask for its own percentage for its session, from 0 to 255, with the
+            `x-ml-video.fecPercent` RTSP attribute (Moonlight X, Penumbra). That request is used instead of this
+            setting, for both the FEC sent and the bitrate left for FEC overhead. Clients that don't ask get this
+            setting, as before.}
             @warning{Higher values can correct for more network packet loss,
             but at the cost of increasing bandwidth usage.}
         </td>

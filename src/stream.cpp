@@ -914,7 +914,7 @@ namespace stream {
       bitrate_override > 0 ? bitrate_override : config.monitor.bitrate,
       fps <= 4000 ? int(fps) : 4001,
       block - sizeof(video_packet_raw_t), block + prefix, sizeof(video_short_frame_header_t),
-      pyro ? std::max(config::stream.pyrowave_critical_fec_percentage, pyrowave::policy::MAX_DETAIL_FEC_PERCENTAGE) : config::stream.fec_percentage,
+      pyro ? std::max(config::stream.pyrowave_critical_fec_percentage, pyrowave::policy::MAX_DETAIL_FEC_PERCENTAGE) : config.fecPercentage,
       std::max(config.minRequiredFecPackets, pyro ? 2 : 0), pyro,
     });
   }
@@ -2619,7 +2619,7 @@ namespace stream {
       // Critical shards receive baseline parity. Stable pictures at low cadence
       // may also protect detail, bounded by unused bitrate and FEC block capacity.
       const bool pyrowave_session = session->config.monitor.videoFormat == pyrowave::protocol::BITSTREAM_FORMAT;
-      auto fecPercentage = pyrowave_session ? 0 : config::stream.fec_percentage;
+      auto fecPercentage = pyrowave_session ? 0 : session->config.fecPercentage;
       if (session->video.adaptive_pacing_enabled) {
         session->stats.wire_frame_index.store(packet->frame_index(), std::memory_order_relaxed);
       }
@@ -2867,9 +2867,9 @@ namespace stream {
             sizeof(frame_header),
             payload_blocksize,
             wire_bytes,
-            // The configured value: oversized frames zero fecPercentage for
+            // The session's value: oversized frames zero fecPercentage for
             // themselves only and must not move the controller's wire floor.
-            config::stream.fec_percentage,
+            session->config.fecPercentage,
             min_parity_shards
           );
           pacing::adaptive_pacing_events_t events;

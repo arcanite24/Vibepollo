@@ -159,6 +159,11 @@ TEST(FramerateUhz, ExactRateMustBeWithinOneFrameOfMaxFps) {
   EXPECT_TRUE(video::policy::exact_framerate_matches(71831700, 1'000'000, 72));
   EXPECT_TRUE(video::policy::exact_framerate_matches(119880120, 1'000'000, 120));
   EXPECT_FALSE(video::policy::exact_framerate_matches(60000000, 1'000'000, 120));
+  // A 120 Hz panel that really runs at 118.97 Hz (Odin 2 Portal)
+  EXPECT_TRUE(video::policy::exact_framerate_matches(118970732, 1'000'000, 120));
+  EXPECT_TRUE(video::policy::exact_framerate_matches(11897, 100, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(118000000, 1'000'000, 120));
+  EXPECT_FALSE(video::policy::exact_framerate_matches(144000000, 1'000'000, 120));
 }
 
 TEST(VideoOutputPolicy, KeepsConfiguredVirtualOutputWhenAnotherVirtualDisplayEnumeratesFirst) {

@@ -79,8 +79,12 @@ namespace video::policy {
     if (exact_value <= 0 || units_per_hz <= 0 || framerate <= 0) {
       return false;
     }
-    const auto difference = exact_value - std::int64_t {framerate} * units_per_hz;
-    return difference > -units_per_hz && difference < units_per_hz;
+    // Within 1 fps, or 1.5% for high rates: panels sold as 120 Hz often run near 119 Hz, and the
+    // client asks for what it measured. A stale 60 Hz rate with maxFPS 120 is still refused.
+    const auto nominal = std::int64_t {framerate} * units_per_hz;
+    const auto tolerance = std::max<std::int64_t>(units_per_hz, nominal * 15 / 1000);
+    const auto difference = exact_value - nominal;
+    return difference > -tolerance && difference < tolerance;
   }
 
   std::optional<std::string> select_encoder(
